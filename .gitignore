@@ -1,0 +1,11 @@
+node_modules/
+.env
+playwright-report/
+test-results/
+blob-report/
+.chrome-cdp-profile/
+*.log
+.DS_Store
+dashboard/run-results.json
+dashboard/testcases.json
+dashboard/bugs.json

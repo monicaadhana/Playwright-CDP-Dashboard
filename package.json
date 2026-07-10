@@ -1,0 +1,26 @@
+{
+  "name": "playwright-cdp-automation",
+  "version": "1.0.0",
+  "description": "Playwright test project that runs over CDP, with a dashboard to control the test flow and a Playwright MCP wired through CDP.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "chrome": "node scripts/launch-chrome.mjs",
+    "chrome:stop": "node scripts/stop-chrome.mjs",
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "report": "playwright show-report",
+    "dashboard": "node dashboard/server.mjs"
+  },
+  "dependencies": {
+    "exceljs": "^4.4.0",
+    "express": "^4.21.2",
+    "multer": "^2.2.0",
+    "ws": "^8.18.0",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.1",
+    "@types/node": "^22.10.5"
+  }
+}
