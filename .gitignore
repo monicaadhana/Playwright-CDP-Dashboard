@@ -9,3 +9,9 @@ blob-report/
 dashboard/run-results.json
 dashboard/testcases.json
 dashboard/bugs.json
+
+# Tesseract OCR language data (downloaded on demand)
+*.traineddata
+
+# Playwright MCP artifacts
+.playwright-mcp/

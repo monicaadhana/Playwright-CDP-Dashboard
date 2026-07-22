@@ -351,7 +351,7 @@ waitText Do you want to exit</textarea>
                 <textarea id="aioDesc" spellcheck="false" style="width:100%;min-height:90px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:7px;padding:8px 10px;font-family:var(--mono);font-size:12px;resize:vertical" placeholder="e.g. App is at https://your-app.com. Log in with user@example.com / your-password. The upload button is top-right; use sample.pdf as the file."></textarea>
                 <label for="aioBase">Base URL (optional)</label>
                 <input type="text" id="aioBase" placeholder="https://client.diro.io" />
-                <div class="row"><button id="aioRun" class="primary">▶ Run folder test cases</button></div>
+                <div class="row"><button id="aioRun" class="primary">▶ Run selected test cases</button></div>
                 <div class="prog" id="aioProg" hidden><span></span></div>
                 <div id="aioResult"></div>
               </div>
@@ -1236,17 +1236,97 @@ waitText Do you want to exit</textarea>
         $('aioFolderList').innerHTML = r.folders.map((f) => `<option value="${escapeHtml(f.path)}">${f.count} cases</option>`).join('');
         $('aioCases').innerHTML = `<p class="muted" style="margin:0">${r.total} cases across ${r.folders.length} folders. Pick a folder above (autocomplete) and Fetch.</p>`;
       };
+      // Fetched AIO cases + which keys are ticked to run. Deleting a row removes it
+      // from this list (client-side only — AIO cases aren't saved to the registry).
+      // aioExpanded = keys whose steps are shown; steps are cached on the case object.
+      let aioFetched = [];
+      const aioSelected = new Set();
+      const aioExpanded = new Set();
+      // Click a case key to load + show its steps (the same steps the run uses).
+      async function toggleAioSteps(key) {
+        const c = aioFetched.find((x) => x.key === key);
+        if (!c) return;
+        if (aioExpanded.has(key)) { aioExpanded.delete(key); renderAioCases(); return; }
+        aioExpanded.add(key);
+        if (!c._steps) {
+          c._loading = true; renderAioCases();
+          const projectKey = $('aioProject').value.trim();
+          try {
+            const r = await (await fetch('/api/aio/case/' + encodeURIComponent(projectKey) + '/' + encodeURIComponent(key))).json();
+            c._steps = r.ok ? r.steps : [];
+            c._err = r.ok ? null : r.error;
+          } catch (e) { c._steps = []; c._err = String(e); }
+          c._loading = false;
+        }
+        renderAioCases();
+      }
+      function renderAioCases() {
+        const el = $('aioCases');
+        if (!aioFetched.length) { el.innerHTML = '<p class="muted">No test cases to run. Fetch a folder (any you removed are gone until you re-fetch).</p>'; return; }
+        const allSel = aioFetched.every((c) => aioSelected.has(c.key));
+        let html = `<p class="muted" style="margin:0 0 6px">${aioSelected.size} of ${aioFetched.length} selected — will run without saving. Click a key to see its steps.</p>`;
+        html += `<table><thead><tr>`
+          + `<th style="width:26px;text-align:center"><input type="checkbox" id="aioSelAll" ${allSel ? 'checked' : ''} title="Select / deselect all"/></th>`
+          + `<th>Key</th><th>Title</th><th style="width:30px"></th></tr></thead><tbody>`;
+        for (const c of aioFetched) {
+          const open = aioExpanded.has(c.key);
+          html += `<tr>`
+            + `<td style="text-align:center"><input type="checkbox" class="aioChk" data-key="${escapeHtml(c.key)}" ${aioSelected.has(c.key) ? 'checked' : ''}/></td>`
+            + `<td style="font-family:var(--mono);white-space:nowrap"><span class="aioKey" data-key="${escapeHtml(c.key)}" title="Show/hide steps" style="cursor:pointer;user-select:none">${open ? '▾' : '▸'} ${escapeHtml(c.key)}</span></td>`
+            + `<td>${escapeHtml(c.title)}</td>`
+            + `<td style="text-align:center"><span class="aioDel" data-key="${escapeHtml(c.key)}" title="Remove from this run" style="cursor:pointer">🗑️</span></td>`
+            + `</tr>`;
+          if (open) {
+            html += `<tr class="aioStepsRow"><td></td><td colspan="3" style="padding:2px 0 10px">`;
+            if (c._loading) html += `<span class="muted">Loading steps…</span>`;
+            else if (c._err) html += `<span style="color:var(--red);font-size:12px">${escapeHtml(c._err)}</span>`;
+            else if (!c._steps || !c._steps.length) html += `<span class="muted">No steps defined in this case.</span>`;
+            else {
+              html += `<table style="width:100%;font-size:11px;border-collapse:collapse"><thead><tr>`
+                + `<th style="width:22px">#</th><th>Step</th><th>Data</th><th>Expected Result</th></tr></thead><tbody>`;
+              c._steps.forEach((s, i) => {
+                html += `<tr>`
+                  + `<td style="vertical-align:top;color:var(--muted)">${i + 1}</td>`
+                  + `<td style="vertical-align:top">${escapeHtml(s.step)}</td>`
+                  + `<td style="vertical-align:top;color:var(--muted)">${escapeHtml(s.data || '')}</td>`
+                  + `<td style="vertical-align:top;color:var(--muted)">${escapeHtml(s.expected || '')}</td>`
+                  + `</tr>`;
+              });
+              html += `</tbody></table>`;
+            }
+            html += `</td></tr>`;
+          }
+        }
+        html += `</tbody></table>`;
+        el.innerHTML = html;
+        $('aioSelAll').onchange = (e) => {
+          if (e.target.checked) aioFetched.forEach((c) => aioSelected.add(c.key));
+          else aioSelected.clear();
+          renderAioCases();
+        };
+        el.querySelectorAll('.aioChk').forEach((cb) => (cb.onchange = () => {
+          if (cb.checked) aioSelected.add(cb.dataset.key); else aioSelected.delete(cb.dataset.key);
+          renderAioCases();
+        }));
+        el.querySelectorAll('.aioKey').forEach((k) => (k.onclick = () => toggleAioSteps(k.dataset.key)));
+        el.querySelectorAll('.aioDel').forEach((d) => (d.onclick = () => {
+          aioFetched = aioFetched.filter((c) => c.key !== d.dataset.key);
+          aioSelected.delete(d.dataset.key);
+          aioExpanded.delete(d.dataset.key);
+          renderAioCases();
+        }));
+      }
       $('aioFetch').onclick = async () => {
         const key = $('aioProject').value.trim(); if (!key) { alert('Enter the AIO project key.'); return; }
         const folderPath = $('aioFolderPath').value.trim();
         $('aioCases').innerHTML = '<p class="muted">Fetching…</p>';
         const r = await (await fetch('/api/aio/cases/' + encodeURIComponent(key) + (folderPath ? '?folderPath=' + encodeURIComponent(folderPath) : ''))).json();
         if (!r.ok) { $('aioCases').innerHTML = `<p style="color:var(--red);font-size:12px">${escapeHtml(r.error)}</p>`; return; }
-        if (!r.cases.length) { $('aioCases').innerHTML = '<p class="muted">No test cases in that folder.</p>'; return; }
-        let html = `<p class="muted" style="margin:0 0 6px">${r.cases.length} test case(s) — will run without saving:</p><table><tbody>`;
-        for (const c of r.cases) html += `<tr><td style="font-family:var(--mono);white-space:nowrap">${escapeHtml(c.key)}</td><td>${escapeHtml(c.title)}</td></tr>`;
-        html += `</tbody></table>`;
-        $('aioCases').innerHTML = html;
+        aioFetched = (r.cases || []).slice();
+        aioSelected.clear();
+        aioFetched.forEach((c) => aioSelected.add(c.key)); // default: everything ticked
+        if (!aioFetched.length) { $('aioCases').innerHTML = '<p class="muted">No test cases in that folder.</p>'; return; }
+        renderAioCases();
       };
       $('aioRun').onclick = async () => {
         const projectKey = $('aioProject').value.trim(); if (!projectKey) { alert('Enter the AIO project key.'); return; }
@@ -1254,10 +1334,12 @@ waitText Do you want to exit</textarea>
         const description = $('aioDesc').value.trim();
         const baseUrl = $('aioBase').value.trim();
         const setup = $('aioSetup').value.trim();
-        if (!confirm(`Run all test cases in "${projectKey}${folderPath ? '/' + folderPath : ''}" via the AI executor? (Results go to Run Results; nothing is saved to the registry.)`)) return;
+        const ids = aioFetched.filter((c) => aioSelected.has(c.key)).map((c) => c.key);
+        if (!ids.length) { alert('Select at least one test case to run (tick its checkbox), then Run.'); return; }
+        if (!confirm(`Run ${ids.length} selected test case(s) via the AI executor? (Results go to Run Results; nothing is saved to the registry.)`)) return;
         $('aioProg').hidden = false; $('aioProg').firstElementChild.style.width = '8%';
         $('aioResult').innerHTML = '<p class="muted">Starting run…</p>';
-        const r = await api('/api/aio/run', { projectKey, folderPath, description, baseUrl, setup });
+        const r = await api('/api/aio/run', { projectKey, folderPath, description, baseUrl, setup, ids });
         if (!r.ok) { $('aioProg').hidden = true; $('aioResult').innerHTML = `<p style="color:var(--red);font-size:12px">❌ ${escapeHtml(r.error)}</p>`; }
       };
       // Progress for AIO runs comes over the shared 'grouprun' channel (see handleGroupRun).

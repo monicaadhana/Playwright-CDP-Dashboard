@@ -22,7 +22,12 @@ try {
   /* no .env file — AI features report "not configured" */
 }
 const gemini = await import('./gemini.mjs');
-const { planFromCommand, planFromTestCase, runPlan } = await import('./browser-control.mjs');
+const { planFromCommand, planFromTestCase, runPlan, connectPage, runCaseAgent, runCpPositive } = await import('./browser-control.mjs');
+
+// Critical flows with a hand-written DETERMINISTIC driver (reliable, real assertions) —
+// used instead of the AI executor. Keyed by AIO case key. They run from the dashboard
+// using the Base URL the user typed. Add more entries here as you harden more flows.
+const DETERMINISTIC_FLOWS = { 'DIRO-TC-1943': runCpPositive };
 const multer = (await import('multer')).default;
 const excel = await import('./excel.mjs');
 const jira = await import('./jira.mjs');
@@ -86,6 +91,21 @@ function saveRuns() {
 }
 const screenshotUrl = (rel) =>
   rel && rel.startsWith('test-results/') ? '/artifacts/' + rel.slice('test-results/'.length) : null;
+
+// Guarantee every test case has at least one screenshot: capture the page's final
+// state (pass or fail) into <shotDir>/final.png. Works even for cases that failed
+// before any step ran (e.g. a Gemini planning error), since the shared page is live.
+// Returns the servable URL, or null if the page couldn't be captured.
+async function captureFinalShot(page, shotDir, shotName) {
+  if (!page) return null;
+  try {
+    mkdirSync(shotDir, { recursive: true });
+    await page.screenshot({ path: path.join(shotDir, 'final.png') });
+    return `/artifacts/${shotName}/final.png`;
+  } catch {
+    return null;
+  }
+}
 
 /** Build the run-history store from the reporter event stream. */
 function recordEvent(event) {
@@ -462,7 +482,11 @@ app.post('/api/registry/run-group', async (req, res) => {
   const tests = [];
   broadcast({ channel: 'grouprun', state: 'start', group: groupName, total: ids.length });
   log(`Run functionality "${groupName}" — ${ids.length} case(s)`, 'meta');
+  // One shared CDP connection for the whole group (see connectPage) — reconnecting
+  // per case deadlocks once a flow leaves a native dialog open. Closed in `finally`.
+  let sharedSession = null;
   try {
+    sharedSession = await connectPage();
     for (let i = 0; i < ids.length; i++) {
       const tc = registry.get(ids[i]);
       if (!tc) continue;
@@ -474,7 +498,7 @@ app.post('/api/registry/run-group', async (req, res) => {
       try {
         mkdirSync(shotDir, { recursive: true });
         const plan = await planFromTestCase(tc, baseUrl);
-        const result = await runPlan(plan, () => {}, { shotDir, shotUrlBase: `/artifacts/${shotName}` });
+        const result = await runPlan(plan, () => {}, { shotDir, shotUrlBase: `/artifacts/${shotName}`, page: sharedSession.page });
         steps = result.results;
         const fi = steps.findIndex((s) => s.status === 'failed');
         status = steps.length && fi === -1 ? 'passed' : 'failed';
@@ -483,6 +507,10 @@ app.post('/api/registry/run-group', async (req, res) => {
         status = 'failed';
         error = e.message;
       }
+      // Always capture a final screenshot so every case has at least one.
+      const finalShot = await captureFinalShot(sharedSession.page, shotDir, shotName);
+      const shots = steps.map((s) => s.shot).filter(Boolean);
+      if (finalShot) shots.push(finalShot);
       tests.push({
         id: tc['Test Case ID'],
         title: `${tc['Test Case ID']} — ${tc['Test Case Name']}`,
@@ -492,7 +520,7 @@ app.post('/api/registry/run-group', async (req, res) => {
         error,
         failedStep,
         expected: tc['Expected Result'] || '',
-        screenshots: steps.map((s) => s.shot).filter(Boolean),
+        screenshots: shots,
         steps,
       });
       broadcast({ channel: 'grouprun', state: 'case', group: groupName, index: i, total: ids.length, title: tc['Test Case Name'], status });
@@ -519,6 +547,7 @@ app.post('/api/registry/run-group', async (req, res) => {
     broadcast({ channel: 'grouprun', state: 'error', group: groupName, error: err.message });
     log(`Functionality run error: ${err.message}`, 'stderr');
   } finally {
+    if (sharedSession) await sharedSession.browser.close().catch(() => {}); // disconnect only; leaves Chrome running
     groupRunBusy = false;
   }
 });
@@ -540,8 +569,10 @@ app.post('/api/registry/:id/run', async (req, res) => {
   const started = Date.now();
   const shotName = `reg-${String(tcId).replace(/[^\w.-]/g, '_')}-${started}`;
   const shotDir = path.join(ROOT, 'test-results', shotName);
+  let sharedSession = null;
   try {
     mkdirSync(shotDir, { recursive: true });
+    sharedSession = await connectPage();
     broadcast({ channel: 'ai', kind: 'control', state: 'planning', command: `Run ${tcId} — ${tc['Test Case Name']}` });
     log(`Run test case ${tcId}: ${tc['Test Case Name']}`, 'meta');
     const steps = await planFromTestCase(tc, baseUrl);
@@ -553,12 +584,16 @@ app.post('/api/registry/:id/run', async (req, res) => {
         broadcast({ channel: 'ai', kind: 'control', state: 'step', update });
         log(`  [${update.status}] ${update.text}${update.error ? ' — ' + update.error : ''}`, update.status === 'failed' ? 'stderr' : 'meta');
       },
-      { shotDir, shotUrlBase: `/artifacts/${shotName}` },
+      { shotDir, shotUrlBase: `/artifacts/${shotName}`, page: sharedSession.page },
     );
 
     const steps2 = result.results;
     const firstFailIdx = steps2.findIndex((r) => r.status === 'failed');
     const passed = steps2.length > 0 && firstFailIdx === -1;
+    // Always capture a final screenshot so the case has at least one.
+    const finalShot = await captureFinalShot(sharedSession.page, shotDir, shotName);
+    const shots = steps2.map((r) => r.shot).filter(Boolean);
+    if (finalShot) shots.push(finalShot);
     const run = {
       id: `reg-${started}`,
       startedAt: started,
@@ -574,7 +609,7 @@ app.post('/api/registry/:id/run', async (req, res) => {
         error: firstFailIdx >= 0 ? steps2[firstFailIdx].error : null,
         failedStep: firstFailIdx >= 0 ? firstFailIdx + 1 : '',
         expected: tc['Expected Result'] || '',
-        screenshots: steps2.map((r) => r.shot).filter(Boolean),
+        screenshots: shots,
         steps: steps2,
       }],
     };
@@ -590,6 +625,7 @@ app.post('/api/registry/:id/run', async (req, res) => {
     broadcast({ channel: 'ai', kind: 'control', state: 'error', error: err.message });
     log(`Test case run error: ${err.message}`, 'stderr');
   } finally {
+    if (sharedSession) await sharedSession.browser.close().catch(() => {}); // disconnect only; leaves Chrome running
     caseRunBusy = false;
   }
 });
@@ -932,6 +968,23 @@ app.get('/api/aio/cases/:projectKey', async (req, res) => {
   }
 });
 
+// Steps of a single AIO case — for the dashboard step-preview (clicking a case key).
+// These are the SAME steps the run feeds to the AI, so the preview reflects reality.
+app.get('/api/aio/case/:projectKey/:caseKey', async (req, res) => {
+  try {
+    const { projectKey, caseKey } = req.params;
+    const detail = await aio.getDetail(projectKey, caseKey);
+    const steps = (Array.isArray(detail.steps) ? detail.steps : []).map((s) => ({
+      step: aio.stripHtml(s.step || ''),
+      data: aio.stripHtml(s.data || s.testData || ''),
+      expected: aio.stripHtml(s.expectedResult || ''),
+    }));
+    res.json({ ok: true, title: detail.title || caseKey, steps });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err.message });
+  }
+});
+
 // Fetch an AIO folder's test cases and RUN them via the AI executor — nothing is
 // saved to the registry; the combined result + bugs land in Run Results, tagged
 // to the folder. `description` gives shared flow/test-data context to the AI.
@@ -942,6 +995,9 @@ app.post('/api/aio/run', async (req, res) => {
   const description = String(req.body?.description || '').trim();
   const baseUrl = String(req.body?.baseUrl || '').trim();
   const setup = String(req.body?.setup || '').trim(); // deterministic preamble to reach the screen
+  // Optional subset of case keys to run (from the dashboard checkboxes). When omitted,
+  // the whole folder runs (backwards-compatible).
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String).filter(Boolean) : null;
   if (!projectKey) return res.status(400).json({ ok: false, error: 'AIO project key is required.' });
   if (!aio.isConfigured()) return res.status(400).json({ ok: false, error: 'AIO is not configured (set AIO_API_KEY).' });
   if (!gemini.isConfigured()) return res.status(400).json({ ok: false, error: 'Gemini is not configured (set GEMINI_API_KEY).' });
@@ -959,11 +1015,23 @@ app.post('/api/aio/run', async (req, res) => {
     const map = await aio.folderPathMap(projectKey);
     let cases = await aio.listCases(projectKey);
     if (folderPath) cases = cases.filter((c) => folderMatch(c.folder ? map[c.folder.ID] || c.folder.name : '', folderPath));
-    if (!cases.length) { broadcast({ channel: 'grouprun', state: 'error', group, error: 'No test cases found for that folder.' }); aioRunBusy = false; return; }
+    // Restrict to the selected case keys (preserving the selected order) when provided.
+    if (ids && ids.length) {
+      const want = new Set(ids);
+      cases = cases.filter((c) => want.has(String(c.key)));
+      cases.sort((a, b) => ids.indexOf(String(a.key)) - ids.indexOf(String(b.key)));
+    }
+    if (!cases.length) { broadcast({ channel: 'grouprun', state: 'error', group, error: ids ? 'None of the selected test cases were found.' : 'No test cases found for that folder.' }); aioRunBusy = false; return; }
     broadcast({ channel: 'grouprun', state: 'start', group, total: cases.length });
     log(`AIO run "${group}" — ${cases.length} case(s)`, 'meta');
 
     const tests = [];
+    // One shared CDP connection for the ENTIRE run — reconnecting per case deadlocks
+    // once a flow leaves a native dialog open (see connectPage). The persistent page's
+    // dialog handler stays live across all cases; the per-case setup preamble resets
+    // it back to the target screen.
+    const sharedSession = await connectPage();
+    try {
     for (let i = 0; i < cases.length; i++) {
       const c = cases[i];
       broadcast({ channel: 'grouprun', state: 'case', group, index: i, total: cases.length, title: c.title, status: 'running' });
@@ -976,15 +1044,27 @@ app.post('/api/aio/run', async (req, res) => {
         const detail = await aio.getDetail(projectKey, c.key);
         const tc = aio.mapCase(detail, map, projectKey);
         expected = tc['Expected Result'] || '';
-        // With a setup preamble, the browser is already on the target screen —
-        // tell the planner not to navigate, and skip any goto it emits.
-        const ctx = description + (setup ? '\n\nNOTE: The browser is ALREADY on the target screen (reached by setup). Do NOT navigate or goto. Only perform this test case’s specific interactions and checks on the current screen.' : '');
-        const plan = await planFromTestCase(tc, baseUrl, ctx);
-        const result = await runPlan(plan, () => {}, {
-          shotDir, shotUrlBase: `/artifacts/${shotName}`,
-          preamble: setup ? { text: setup, baseUrl } : null,
-          skipGoto: !!setup,
-        });
+        const onStep = (u) => log(`  [${u.status}] ${(u.text || '').slice(0, 70)}${u.error ? ' — ' + u.error : ''}`, u.status === 'failed' ? 'stderr' : 'meta');
+        let result;
+        if (DETERMINISTIC_FLOWS[c.key]) {
+          // Critical flow: run the reliable hand-written driver with the user's Base URL.
+          log(`  (deterministic driver for ${c.key})`, 'meta');
+          result = await DETERMINISTIC_FLOWS[c.key](baseUrl, {
+            page: sharedSession.page, shotDir, shotUrlBase: `/artifacts/${shotName}`, onStep,
+          });
+        } else {
+          // Observe→act: drive the case's OWN steps, grounding each action in the live page.
+          // No blind plan, no Flow-context needed — reads step + data + expected + the real
+          // on-screen elements. baseUrl only supplies a dynamic/session URL.
+          const caseSteps = (Array.isArray(detail.steps) ? detail.steps : []).map((s) => ({
+            step: aio.stripHtml(s.step || ''),
+            data: aio.stripHtml(s.data || s.testData || ''),
+            expected: aio.stripHtml(s.expectedResult || ''),
+          }));
+          result = await runCaseAgent(caseSteps, {
+            baseUrl, page: sharedSession.page, shotDir, shotUrlBase: `/artifacts/${shotName}`, onStep,
+          });
+        }
         steps = result.results;
         const fi = steps.findIndex((s) => s.status === 'failed');
         status = steps.length && fi === -1 ? 'passed' : 'failed';
@@ -993,12 +1073,19 @@ app.post('/api/aio/run', async (req, res) => {
         status = 'failed';
         error = e.message;
       }
+      // Always capture a final screenshot so every case has at least one.
+      const finalShot = await captureFinalShot(sharedSession.page, shotDir, shotName);
+      const shots = steps.map((s) => s.shot).filter(Boolean);
+      if (finalShot) shots.push(finalShot);
       tests.push({
         id: c.key, title: `${c.key} — ${c.title}`, file: c.key, status,
         duration: Date.now() - t0, error, failedStep, expected,
-        screenshots: steps.map((s) => s.shot).filter(Boolean), steps,
+        screenshots: shots, steps,
       });
       broadcast({ channel: 'grouprun', state: 'case', group, index: i, total: cases.length, title: c.title, status });
+    }
+    } finally {
+      await sharedSession.browser.close().catch(() => {}); // disconnect only; leaves Chrome running
     }
     const passed = tests.filter((t) => t.status === 'passed').length;
     const run = { id: runId, startedAt: started, finishedAt: Date.now(), status: passed === tests.length ? 'passed' : 'failed', source: 'aio', group, tests };

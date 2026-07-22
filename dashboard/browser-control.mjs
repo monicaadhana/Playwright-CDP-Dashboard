@@ -1,5 +1,6 @@
 // Execute a Gemini-produced step plan against the CDP Chrome using Playwright.
 import { chromium } from '@playwright/test';
+import { createWorker } from 'tesseract.js';
 import { generateJSON } from './gemini.mjs';
 import { CDP_ENDPOINT } from '../scripts/chrome-utils.mjs';
 
@@ -28,7 +29,20 @@ Each step is one of:
   {"by":"css","selector":".btn-primary"}   (last resort)
 
 Prefer role/label/text locators over css. Add explicit goto steps when a URL is implied.
-Keep the plan minimal and ordered.`;
+Keep the plan minimal and ordered.
+
+CRITICAL interaction rules (the target app has custom widgets and hidden helper elements):
+- Target only VISIBLE, meaningful elements. Never rely on a bare
+  {"by":"role","role":"textbox"} when a screen has multiple inputs — prefer a placeholder,
+  label, or the option's visible text. Ignore hidden helper inputs.
+- Dropdowns / searchable pickers (country selector, bank selector, comboboxes, "select2"
+  widgets) are NOT a single textbox. To pick a value, emit THREE steps:
+  (1) click the picker/control to open it,
+  (2) fill the search box that appears with the value,
+  (3) click the matching option by its exact visible text (e.g. {"by":"text","text":"Trinidad and Tobago"}).
+- To choose an item from a list of results, click it by its visible text.
+- After any step that changes the screen (navigation, opening/closing a pop-up), add a
+  waitFor or expectVisible on distinctive text of the NEW screen before the next action.`;
 
 /** Ask Gemini to turn a command into a step plan. */
 export async function planFromCommand(command, currentUrl) {
@@ -96,17 +110,35 @@ function describe(step) {
  * @param {Array} steps
  * @param {(update: {index:number,total:number,text:string,status:string,error?:string}) => void} onStep
  */
-export async function runPlan(steps, onStep, opts = {}) {
-  const { shotDir = null, shotUrlBase = null, preamble = null, skipGoto = false } = opts;
+/**
+ * Open ONE CDP connection and return its browser + first page, with a persistent
+ * dialog auto-accept handler attached. Reuse this across many runPlan() calls so a
+ * whole group run shares a single connection — reconnecting per test deadlocks when
+ * a flow (e.g. DIRO capture) leaves a native dialog open, because the dismiss handler
+ * can only attach AFTER connectOverCDP, which the open dialog itself blocks.
+ */
+export async function connectPage() {
   const browser = await chromium.connectOverCDP(CDP_ENDPOINT);
+  const context = browser.contexts()[0] ?? (await browser.newContext());
+  const page = context.pages()[0] ?? (await context.newPage());
+  await page.bringToFront().catch(() => {});
+  // Some flows raise a native beforeunload/confirm dialog on close/navigate — dismiss
+  // it (stay on page) so it doesn't stall the run or block the next connect.
+  page.on('dialog', (d) => d.accept().catch(() => {}));
+  // Document clicks in the DIRO capture trigger file downloads; consume the event so
+  // Playwright handles it (to a temp file) instead of leaving it pending. DIRO captures
+  // the document server-side, so we don't need the downloaded file itself.
+  page.on('download', () => {});
+  return { browser, page };
+}
+
+export async function runPlan(steps, onStep, opts = {}) {
+  const { shotDir = null, shotUrlBase = null, preamble = null, skipGoto = false, page: externalPage = null } = opts;
+  // Reuse a caller-provided page (shared connection) when given; otherwise open our
+  // own connection for this single plan and close it in `finally`.
+  const session = externalPage ? null : await connectPage();
+  const page = externalPage ?? session.page;
   try {
-    const context = browser.contexts()[0] ?? (await browser.newContext());
-    const page = context.pages()[0] ?? (await context.newPage());
-    await page.bringToFront().catch(() => {});
-    // Some flows raise a native beforeunload/confirm dialog on close — dismiss it
-    // (stay on page) so it doesn't stall the run.
-    const onDialog = (d) => d.accept().catch(() => {});
-    page.on('dialog', onDialog);
 
     // Deterministic setup preamble: reliably reach the target screen before the
     // AI-planned case steps run (no locator guessing for navigation).
@@ -139,7 +171,7 @@ export async function runPlan(steps, onStep, opts = {}) {
       onStep({ index: i, total: steps.length, text, status: 'running' });
       const started = Date.now();
       try {
-        await execStep(page, step);
+        await execStepWithRetry(page, step, onStep, { index: i, total: steps.length, text });
         const shot = await capture(i);
         onStep({ index: i, total: steps.length, text, status: 'passed', shot });
         results.push({ text, status: 'passed', shot, duration: Date.now() - started });
@@ -152,38 +184,179 @@ export async function runPlan(steps, onStep, opts = {}) {
     }
     return { url: page.url(), results };
   } finally {
-    await browser.close(); // disconnect only; leaves Chrome running
+    // Only close a connection we opened here; a shared (external) page is closed by
+    // its owner (the group run) after all cases finish. Disconnect leaves Chrome up.
+    if (session) await session.browser.close();
   }
 }
 
-async function execStep(page, step) {
-  const timeout = 15000;
+// Apps like DIRO keep hidden helper inputs (e.g. a paste-capture
+// <textarea id="targetID" class="target">) that pollute generic role locators and trip
+// strict-mode violations. Resolve every action to the FIRST VISIBLE, non-helper match so
+// the AI's generic locators land on the real on-screen element instead of a hidden decoy.
+// `root` is a Page OR a Frame — both expose the same getByRole/locator API.
+const DECOY = ':not(#targetID):not(.target)';
+function actionable(root, loc) {
+  return resolveLocator(root, loc).filter({ visible: true }).and(root.locator(DECOY)).first();
+}
+
+// DIRO embeds the bank / testing99 UI (bank list, document list, download) inside an
+// iframe, so main-frame-only locators miss it. Poll EVERY frame up to `timeout` for a
+// visible, non-decoy match and return that frame-scoped locator, or null if none appears.
+async function findAcrossFrames(page, loc, timeout) {
+  const end = Date.now() + timeout;
+  for (;;) {
+    for (const frame of page.frames()) {
+      try {
+        const cand = actionable(frame, loc);
+        if (await cand.count()) return cand;
+      } catch { /* frame navigated/detached mid-search — skip */ }
+    }
+    if (Date.now() >= end) return null;
+    await page.waitForTimeout(400);
+  }
+}
+
+// ---- OCR fallback for CANVAS-rendered screens ---------------------------------------
+// Part of the DIRO capture (the bank/testing99 document list, download UI) is painted on
+// an HTML <canvas> — a remote-browser pixel stream with NO DOM. When a target isn't found
+// in any frame's DOM, we OCR a screenshot, fuzzy-match the target text, and click the
+// pixel. tesseract misreads (e.g. "Utility"->"Utiity"), so matching is fuzzy.
+const norm = (s) => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+// min edits to match `pat` against ANY substring of `text` (ignores extra leading/trailing
+// text such as a right-column item sharing the same OCR line).
+function fuzzySubstr(text, pat) {
+  const n = text.length, m = pat.length;
+  let prev = new Array(n + 1).fill(0);
+  for (let i = 1; i <= m; i++) {
+    const cur = new Array(n + 1); cur[0] = i;
+    for (let j = 1; j <= n; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (pat[i - 1] === text[j - 1] ? 0 : 1));
+    prev = cur;
+  }
+  return Math.min(...prev);
+}
+let _ocrWorker = null;
+async function ocrWorker() { if (!_ocrWorker) _ocrWorker = await createWorker('eng'); return _ocrWorker; }
+// Human-readable text from a locator spec (for OCR matching); null if it has none (css).
+function locatorText(loc) { return (loc && (loc.name || loc.text)) || null; }
+// OCR the current viewport (device-scale = readable), fuzzy-find `target`. Returns the
+// CSS-pixel click point of the best matching line (left edge), or null if none is close.
+async function ocrLocate(page, target) {
+  const want = norm(target);
+  if (!want) return null;
+  const buf = await page.screenshot();
+  const imgW = buf.readUInt32BE(16), imgH = buf.readUInt32BE(20);
+  const vp = await page.evaluate(() => ({ w: window.innerWidth, h: window.innerHeight }));
+  const sx = vp.w / imgW, sy = vp.h / imgH;
+  const w = await ocrWorker();
+  const { data } = await w.recognize(buf, {}, { blocks: true });
+  const thresh = Math.max(2, Math.round(want.length * 0.25));
+  let best = null, bestD = Infinity;
+  for (const bl of data.blocks || []) for (const par of bl.paragraphs || []) for (const ln of par.lines || []) {
+    const d = fuzzySubstr(norm(ln.text), want);
+    if (d < bestD) { bestD = d; best = ln.bbox; }
+  }
+  if (!best || bestD > thresh) return null;
+  return { x: Math.round((best.x0 + 25) * sx), y: Math.round((best.y0 + best.y1) / 2 * sy) };
+}
+// Full OCR text of the viewport (for expectText fallback on canvas screens).
+async function ocrText(page) {
+  const w = await ocrWorker();
+  const { data } = await w.recognize(await page.screenshot());
+  return data.text || '';
+}
+
+// Retry a step up to 3 times, staying on the same screen and giving the UI time to
+// settle (e.g. a button that isn't active/visible yet): try → wait 5s → try → wait 10s
+// → try. Navigation (goto) is not retried. Note: retrying only helps when the target is
+// slow to appear/activate — it cannot find an element/text that genuinely isn't there.
+const RETRY_GAPS_MS = [0, 5000, 10000];
+async function execStepWithRetry(page, step, onStep, meta) {
+  if (step.action === 'goto') { await execStep(page, step); return; }
+  let lastErr;
+  for (let attempt = 0; attempt < RETRY_GAPS_MS.length; attempt++) {
+    if (RETRY_GAPS_MS[attempt]) {
+      if (onStep) onStep({ ...meta, status: 'running', text: `${meta.text} — retry ${attempt} (waited ${RETRY_GAPS_MS[attempt] / 1000}s)` });
+      await page.waitForTimeout(RETRY_GAPS_MS[attempt]);
+    }
+    try {
+      await execStep(page, step, attempt === 0 ? 15000 : 8000);
+      return;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr;
+}
+
+async function execStep(page, step, timeout = 15000) {
   switch (step.action) {
     case 'goto':
       await page.goto(step.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
       break;
-    case 'click':
-      await resolveLocator(page, step.locator).click({ timeout });
+    case 'click': {
+      // Try DOM (across frames) first; if the target has text, cap the DOM wait so we can
+      // fall back to OCR (canvas) reasonably fast — execStepWithRetry covers paint timing.
+      const text = locatorText(step.locator);
+      const el = await findAcrossFrames(page, step.locator, text ? Math.min(timeout, 5000) : timeout);
+      const before = await page.evaluate(() => document.body.innerText.length).catch(() => -1);
+      if (el) {
+        // noWaitAfter: a document click can start a file download, which would otherwise
+        // hang the click waiting for the page to "settle".
+        await el.click({ timeout, noWaitAfter: true });
+      } else {
+        // Canvas fallback: OCR-locate the text and click the pixel.
+        const pt = text && (await ocrLocate(page, text));
+        if (!pt) throw new Error('click target not found (DOM or OCR)');
+        await page.mouse.click(pt.x, pt.y);
+      }
+      // Verify the click had an effect: if the control is STILL present AND the page text is
+      // unchanged, it was a no-op (button not yet wired) — throw so the retry clicks again.
+      // A click that advances the screen / starts a download changes the text.
+      await page.waitForTimeout(1500);
+      const after = await page.evaluate(() => document.body.innerText.length).catch(() => -2);
+      const stillThere = el ? await el.isVisible().catch(() => false) : true;
+      if (stillThere && before === after) {
+        throw new Error('click had no effect (control not active yet) — retrying');
+      }
       break;
-    case 'fill':
-      await resolveLocator(page, step.locator).fill(String(step.text ?? ''), { timeout });
+    }
+    case 'fill': {
+      const el = await findAcrossFrames(page, step.locator, timeout);
+      if (!el) throw new Error('fill target not found in any frame');
+      await el.fill(String(step.text ?? ''), { timeout });
       break;
+    }
     case 'press':
-      if (step.locator) await resolveLocator(page, step.locator).press(step.key, { timeout });
-      else await page.keyboard.press(step.key);
+      if (step.locator) {
+        const el = await findAcrossFrames(page, step.locator, timeout);
+        if (!el) throw new Error('press target not found in any frame');
+        await el.press(step.key, { timeout });
+      } else {
+        await page.keyboard.press(step.key);
+      }
       break;
     case 'waitFor':
-      await resolveLocator(page, step.locator).waitFor({ timeout });
-      break;
     case 'expectVisible': {
-      const visible = await resolveLocator(page, step.locator).first().isVisible();
-      if (!visible) throw new Error('element not visible');
+      // Present in the DOM (any frame) OR visible on the canvas (OCR). Either satisfies it.
+      const text = locatorText(step.locator);
+      const el = await findAcrossFrames(page, step.locator, text ? Math.min(timeout, 5000) : timeout);
+      if (el) break;
+      const pt = text && (await ocrLocate(page, text));
+      if (!pt) throw new Error(step.action === 'click' ? 'element not visible' : 'element did not appear (DOM or OCR)');
       break;
     }
     case 'expectText': {
-      const content = await resolveLocator(page, step.locator).first().textContent({ timeout });
-      if (!content || !content.includes(step.text)) {
-        throw new Error(`expected text "${step.text}", got "${(content ?? '').slice(0, 60)}"`);
+      const el = await findAcrossFrames(page, step.locator, Math.min(timeout, 5000));
+      if (el) {
+        const content = await el.textContent({ timeout }).catch(() => null);
+        if (content && content.includes(step.text)) break;
+      }
+      // OCR fallback: check the full canvas text contains the expected text (fuzzy).
+      const want = norm(step.text);
+      const d = fuzzySubstr(norm(await ocrText(page)), want);
+      if (d > Math.max(2, Math.round(want.length * 0.25))) {
+        throw new Error(`expected text "${step.text}" not found (DOM or OCR)`);
       }
       break;
     }
@@ -272,4 +445,259 @@ export async function execPreamble(page, steps, baseUrl, onStep) {
     }
     if (onStep) onStep({ index: -1, total: 0, text: 'setup: ' + s.raw, status: 'passed' });
   }
+}
+
+// ============================================================================
+// Observe→Act agent executor
+// ----------------------------------------------------------------------------
+// Reads a test case's OWN steps and grounds each action in the LIVE page: at every
+// step it snapshots the real interactive elements (across frames) plus OCR text lines
+// for canvas screens, and asks the model to pick from what ACTUALLY exists — so it
+// never invents locators/labels. No blind pre-planning, no Flow-context needed.
+// ============================================================================
+
+const INTERACTIVE = 'button, a, input:not([type=hidden]), textarea, select, [role=button], [role=link], [role=textbox], [role=tab], [role=option], [role=checkbox], [role=menuitem], [contenteditable=true], .select2-selection, li';
+
+// OCR every text line on the viewport, returning CSS-pixel click points (for canvas).
+async function ocrLines(page) {
+  const buf = await page.screenshot();
+  const imgW = buf.readUInt32BE(16), imgH = buf.readUInt32BE(20);
+  const vp = await page.evaluate(() => ({ w: window.innerWidth, h: window.innerHeight }));
+  const sx = vp.w / imgW, sy = vp.h / imgH;
+  const w = await ocrWorker();
+  const { data } = await w.recognize(buf, {}, { blocks: true });
+  const out = [];
+  for (const bl of data.blocks || []) for (const par of bl.paragraphs || []) for (const ln of par.lines || []) {
+    const t = (ln.text || '').replace(/\s+/g, ' ').trim();
+    if (t) out.push({ text: t, x: Math.round((ln.bbox.x0 + 15) * sx), y: Math.round((ln.bbox.y0 + ln.bbox.y1) / 2 * sy) });
+  }
+  return out;
+}
+
+// Snapshot real, visible interactive elements (all frames) + OCR lines when a canvas is present.
+async function observe(page) {
+  const items = [];
+  let n = 0;
+  const frames = page.frames();
+  for (let fi = 0; fi < frames.length; fi++) {
+    let handles = [];
+    try { handles = await frames[fi].locator(INTERACTIVE).elementHandles(); } catch { continue; }
+    for (const h of handles) {
+      const info = await h.evaluate((el) => {
+        const rects = el.getClientRects();
+        const vis = rects.length > 0 && (el.offsetParent !== null || getComputedStyle(el).position === 'fixed');
+        const name = (el.innerText || el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.value || el.getAttribute('title') || '').replace(/\s+/g, ' ').trim().slice(0, 70);
+        const map = { A: 'link', BUTTON: 'button', INPUT: 'textbox', TEXTAREA: 'textbox', SELECT: 'combobox', LI: 'option' };
+        const role = el.getAttribute('role') || map[el.tagName] || el.tagName.toLowerCase();
+        const decoy = el.id === 'targetID' || (el.className || '').toString().includes('target');
+        return { vis, name, role, decoy };
+      }).catch(() => null);
+      if (info && info.vis && !info.decoy && (info.name || info.role === 'textbox' || info.role === 'combobox')) {
+        items.push({ ref: 'e' + (n++), role: info.role, name: info.name, handle: h });
+      }
+    }
+  }
+  if (await page.locator('canvas').count().catch(() => 0)) {
+    try { for (const ln of await ocrLines(page)) items.push({ ref: 'e' + (n++), role: 'text', name: ln.text, ocr: { x: ln.x, y: ln.y } }); } catch {}
+  }
+  return items;
+}
+
+const serializeObs = (items) => items.map((i) => `${i.ref}: ${i.role} "${i.name}"`).join('\n');
+
+const AGENT_SYSTEM = `You are a browser test agent. You perform ONE step of a manual test case at a time against the CURRENT screen. You get the list of interactive elements currently visible (each with a ref), the step, its test data, and its expected result. Decide the SINGLE next action.
+
+Return ONLY JSON: {"action":"click|fill|press|assertPass|assertFail|done","ref":"e#","value":"...","key":"Enter","reason":"..."}
+Rules:
+- "ref" MUST be one from the element list. NEVER invent a ref or a label.
+- "fill": put the value to type in "value" (use the test data when relevant). "press": set "key".
+- Verification steps (verify/observe/check/see): if the expected item is present in the list, return "assertPass"; if it is clearly absent, return "assertFail".
+- If the expected item isn't present YET but the screen looks like it is loading/transitioning (a "Please wait", spinner, or a screen that clearly hasn't finished), return "wait" (not assertFail) — you'll be shown the screen again after a short pause. Only assertFail when the screen has settled and the expected item is genuinely missing. Prefer "wait" once or twice before giving up.
+- Some steps need several actions (e.g. open a dropdown, type, then click the option). Return them ONE at a time — you'll be called again after each and shown the updated screen.
+- DROPDOWNS / comboboxes / "select2" search fields: do NOT fill the container. First CLICK it to open; on the NEXT turn a search textbox appears — fill THAT, then click the matching option from the list.
+- If a prior action in the history shows "-> ERROR" (e.g. a fill failed), that target was wrong (e.g. not a text input) — choose a different element or click it first.
+- Return "done" when the step is fully performed and needs no more actions.
+- If the step appears ALREADY accomplished (its target isn't present because the flow has already moved to the next screen — e.g. a duplicate step, or a "select X" when X was already selected and a later screen is now shown), return "done" — do NOT force a click on a stale/hidden element.
+- Prefer the element whose name best matches the step/data (fuzzy is fine; OCR text may be slightly misspelled).`;
+
+const DECISION_SCHEMA = {
+  type: 'object',
+  properties: {
+    action: { type: 'string', enum: ['click', 'fill', 'press', 'wait', 'assertPass', 'assertFail', 'done'] },
+    ref: { type: 'string' },
+    value: { type: 'string' },
+    key: { type: 'string' },
+  },
+  required: ['action'],
+};
+async function decideAction(step, obsText, history) {
+  const prompt = `Elements on screen:\n${obsText || '(none found)'}\n\nStep: ${step.step}\nTest data: ${step.data || '(none)'}\nExpected result: ${step.expected || '(none)'}\nActions already done for THIS step: ${history || '(none)'}\n\nSingle next action. "ref" must be ONLY an id like "e5" (never words). "value" is only the literal text to type.`;
+  // responseSchema keeps output to compact valid JSON. Budget of 2048 leaves room for a
+  // Pro model's thinking tokens (thinking counts toward the output budget) while still
+  // capping any runaway. The decision JSON itself is tiny.
+  const d = await generateJSON(prompt, { system: AGENT_SYSTEM, schema: DECISION_SCHEMA, maxOutputTokens: 2048 });
+  if (d && d.ref && !/^e\d+$/.test(String(d.ref).trim())) d.ref = String(d.ref).trim().match(/e\d+/)?.[0] || d.ref; // salvage a clean ref
+  return d;
+}
+
+async function executeDecision(page, decision, items) {
+  const it = items.find((x) => x.ref === decision.ref);
+  switch (decision.action) {
+    case 'click':
+      if (!it) throw new Error(`click: unknown ref ${decision.ref}`);
+      if (it.handle) await it.handle.click({ timeout: 8000, noWaitAfter: true });
+      else if (it.ocr) await page.mouse.click(it.ocr.x, it.ocr.y);
+      break;
+    case 'fill': {
+      if (!it || !it.handle) throw new Error(`fill: unknown/uneditable ref ${decision.ref}`);
+      try {
+        await it.handle.fill(String(decision.value ?? ''), { timeout: 8000 });
+      } catch (e) {
+        // Non-editable target (commonly a dropdown/select2 CONTAINER): deterministically
+        // click it to OPEN — the revealed search box gets filled on the next turn. This
+        // removes the model's need to know "click before typing" for custom pickers.
+        await it.handle.click({ timeout: 5000, noWaitAfter: true }).catch(() => { throw e; });
+      }
+      break;
+    }
+    case 'press':
+      if (it && it.handle) await it.handle.press(decision.key || 'Enter', { timeout: 15000 });
+      else await page.keyboard.press(decision.key || 'Enter');
+      break;
+    case 'wait':
+      await page.waitForTimeout(3500); // let a loading/transition screen settle
+      break;
+    default:
+      break; // no-op
+  }
+}
+
+/**
+ * Execute a manual test case step-by-step via observe->act. `steps` = [{step,data,expected}].
+ * baseUrl is used only to open a dynamic/session URL the static case can't contain.
+ * Returns { url, results:[{text,status,error,shot,duration}] } — same shape as runPlan.
+ */
+export async function runCaseAgent(steps, opts = {}) {
+  const { baseUrl = '', page: externalPage = null, shotDir = null, shotUrlBase = null, onStep = () => {} } = opts;
+  const session = externalPage ? null : await connectPage();
+  const page = externalPage ?? session.page;
+  const results = [];
+  const MAX_ACTIONS = 10;
+  try {
+    if (baseUrl) { try { await page.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }); await page.waitForTimeout(3000); } catch {} }
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i];
+      const text = step.step;
+      onStep({ index: i, total: steps.length, text, status: 'running' });
+      const started = Date.now();
+      let status = 'failed', error = 'step did not complete';
+      const history = [];
+      try {
+        for (let a = 0; a < MAX_ACTIONS; a++) {
+          // Wait for the screen to populate before deciding — pages/pop-ups render a beat
+          // after navigation, and an empty snapshot must not be read as "expected missing".
+          let items = await observe(page);
+          for (let w = 0; items.length === 0 && w < 5; w++) { await page.waitForTimeout(2000); items = await observe(page); }
+          let decision;
+          try { decision = await decideAction(step, serializeObs(items), history.join('; ')); }
+          catch (e) { error = 'planner error: ' + e.message; history.push('planner error -> retry'); await page.waitForTimeout(1000); continue; /* transient (e.g. JSON) — retry */ }
+          if (decision.action === 'assertPass' || decision.action === 'done') { status = 'passed'; error = null; break; }
+          if (decision.action === 'assertFail') { status = 'failed'; error = 'expected not met: ' + (decision.reason || ''); break; }
+          let outcome = 'ok';
+          try { await executeDecision(page, decision, items); }
+          catch (e) { outcome = 'ERROR: ' + (e.message || '').slice(0, 60); error = e.message; /* re-observe next loop */ }
+          history.push(`${decision.action}${decision.ref ? ' ' + decision.ref : ''}${decision.value ? ` "${decision.value}"` : ''} -> ${outcome}`);
+          await page.waitForTimeout(1500);
+        }
+      } catch (e) { status = 'failed'; error = e.message; }
+      let shot = null;
+      if (shotDir) { try { const f = `${shotDir}/step-${i + 1}.png`; await page.screenshot({ path: f }); shot = shotUrlBase ? `${shotUrlBase}/step-${i + 1}.png` : f; } catch {} }
+      const errWithTrace = status === 'failed' && history.length ? `${error}\n[agent tried: ${history.join(' | ')}]` : error;
+      onStep({ index: i, total: steps.length, text, status, error: errWithTrace, shot });
+      results.push({ text, status, error: errWithTrace, shot, duration: Date.now() - started });
+      if (status === 'failed') break; // stop on first failure (matches runPlan)
+    }
+    return { url: page.url(), results };
+  } finally {
+    if (session) await session.browser.close();
+  }
+}
+
+// ============================================================================
+// Deterministic flow: DIRO CP_Positive (DIRO-TC-1943 "Verify Capture process")
+// ----------------------------------------------------------------------------
+// Hand-written, reliable drive with real checkpoints — used INSTEAD of the AI executor
+// for this critical flow. Runs from the dashboard using the Base URL the user typed
+// (baseUrl), so no .env access is needed. Returns { url, results } like runPlan.
+// Registered per case key in server.mjs (DETERMINISTIC_FLOWS).
+// ============================================================================
+export async function runCpPositive(baseUrl, opts = {}) {
+  const { page: externalPage = null, onStep = () => {}, shotDir = null, shotUrlBase = null } = opts;
+  const session = externalPage ? null : await connectPage();
+  const page = externalPage ?? session.page;
+  page.on('dialog', (d) => d.accept().catch(() => {}));
+  const results = [];
+  const TOTAL = 8;
+  let i = 0;
+  const step = async (text, fn) => {
+    const idx = i++;
+    onStep({ index: idx, total: TOTAL, text, status: 'running' });
+    const t0 = Date.now();
+    let status = 'passed', error = null;
+    try { await fn(); } catch (e) { status = 'failed'; error = e.message; }
+    let shot = null;
+    if (shotDir) { try { const f = `${shotDir}/step-${idx + 1}.png`; await page.screenshot({ path: f }); shot = shotUrlBase ? `${shotUrlBase}/step-${idx + 1}.png` : f; } catch {} }
+    onStep({ index: idx, total: TOTAL, text, status, error, shot });
+    results.push({ text, status, error, shot, duration: Date.now() - t0 });
+    if (status === 'failed') throw new Error('__stop__'); // stop the chain on first failure
+  };
+  try {
+    await step('Open verification URL → Privacy pop-up', async () => {
+      if (!baseUrl) throw new Error('Base URL is required — paste the verification link in the dashboard.');
+      await page.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await page.getByRole('button', { name: 'Continue' }).waitFor({ state: 'visible', timeout: 20000 });
+    });
+    await step('Click Continue → Select Your Bank', async () => {
+      const cont = page.getByRole('button', { name: 'Continue' });
+      let ok = false;
+      for (let a = 0; a < 5 && !ok; a++) { await cont.click({ timeout: 8000, noWaitAfter: true }).catch(() => {}); await page.waitForTimeout(2500); ok = await page.getByText(/Select Your Bank/i).isVisible().catch(() => false); }
+      if (!ok) throw new Error('"Select Your Bank" did not appear after clicking Continue');
+    });
+    await step('Select country: Trinidad and Tobago', async () => {
+      await page.locator('.select2-selection').first().click({ timeout: 8000 });
+      await page.locator('.select2-search__field').fill('Trinidad');
+      await page.waitForTimeout(1500);
+      await page.locator('.select2-results__option', { hasText: 'Trinidad' }).first().click({ timeout: 8000 });
+    });
+    await step('Select bank: Testing99', async () => {
+      await page.locator('#floatingInput').fill('Testing99');
+      await page.waitForTimeout(2000);
+      await page.getByText('testing99.diro.me').first().click({ timeout: 10000 });
+    });
+    await step('Bank verification → Start', async () => {
+      const s = page.getByRole('button', { name: /^start$/i });
+      await s.waitFor({ state: 'visible', timeout: 30000 });
+      await s.click({ noWaitAfter: true });
+    });
+    await step('Select document: Utility bill-1 (canvas / OCR)', async () => {
+      let pt = null;
+      for (let a = 0; a < 15 && !pt; a++) { pt = await ocrLocate(page, 'Utility bill-1'); if (!pt) await page.waitForTimeout(4000); }
+      if (!pt) throw new Error('Could not locate "Utility bill-1" on the canvas');
+      await page.mouse.click(pt.x, pt.y);
+    });
+    await step('Download completes → Submit', async () => {
+      let seen = false;
+      for (let a = 0; a < 45 && !seen; a++) { const t = (await page.evaluate(() => (document.body ? document.body.innerText : '')).catch(() => '')) || ''; if (/please review|proceed anyway|download complete|submit/i.test(t)) { seen = true; break; } await page.waitForTimeout(2000); }
+      if (!seen) throw new Error('Download did not complete / no review-submit screen appeared');
+      for (const name of [/proceed anyway/i, /^submit$/i]) { const b = page.getByRole('button', { name }); if ((await b.count().catch(() => 0)) && (await b.first().isVisible().catch(() => false))) { await b.first().click({ noWaitAfter: true }); break; } }
+    });
+    await step('Verify success: "Submission successful"', async () => {
+      await page.getByText(/submission successful|thank you/i).first().waitFor({ state: 'visible', timeout: 120000 });
+    });
+  } catch (e) {
+    if (e.message !== '__stop__') results.push({ text: 'unexpected error', status: 'failed', error: e.message, duration: 0 });
+  } finally {
+    if (session) await session.browser.close();
+  }
+  return { url: page.url(), results };
 }

@@ -4,6 +4,12 @@ const API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
 
 export const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 
+// Transient server-side errors worth retrying: 429 (rate limit), 500 (internal),
+// 503 (UNAVAILABLE / model overloaded — "experiencing high demand").
+const RETRYABLE_STATUS = new Set([429, 500, 503]);
+const MAX_RETRIES = 4; // total attempts = MAX_RETRIES + 1
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 export function isConfigured() {
   return !!process.env.GEMINI_API_KEY;
 }
@@ -28,9 +34,10 @@ export async function generate(prompt, opts = {}) {
       maxOutputTokens: opts.maxOutputTokens ?? 8192,
     },
   };
-  // gemini-2.5-* "think" by default, and thinking tokens eat the output budget
-  // — which truncates long JSON mid-string. Disable it for these calls.
-  if (/2\.5/.test(MODEL)) {
+  // Flash models (2.5-flash, 3.x-flash, gemini-flash-latest) "think" by default, and
+  // thinking tokens eat the output budget — which truncates/mangles JSON mid-string.
+  // Disable it for these calls (verified thinkingBudget:0 is accepted by flash-latest).
+  if (/2\.5|flash/i.test(MODEL)) {
     body.generationConfig.thinkingConfig = { thinkingBudget: opts.thinkingBudget ?? 0 };
   }
   if (opts.system) {
@@ -41,16 +48,34 @@ export async function generate(prompt, opts = {}) {
     if (opts.schema) body.generationConfig.responseSchema = opts.schema;
   }
 
-  const res = await fetch(`${API_BASE}/${MODEL}:generateContent`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(60000),
-  });
-
-  if (!res.ok) {
-    const detail = await res.text().catch(() => '');
-    throw new Error(`Gemini API ${res.status}: ${detail.slice(0, 400)}`);
+  // Retry transient failures (overload/rate-limit/internal + network errors) with
+  // exponential backoff so a temporary Gemini spike doesn't fail the whole run.
+  let res, lastErr;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      res = await fetch(`${API_BASE}/${MODEL}:generateContent`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(60000),
+      });
+    } catch (err) {
+      // Network error / timeout — retryable.
+      lastErr = err;
+      res = null;
+    }
+    if (res && res.ok) break;
+    const retryable = !res || RETRYABLE_STATUS.has(res.status);
+    if (!retryable || attempt === MAX_RETRIES) {
+      if (res && !res.ok) {
+        const detail = await res.text().catch(() => '');
+        throw new Error(`Gemini API ${res.status}: ${detail.slice(0, 400)}`);
+      }
+      throw new Error(`Gemini request failed after ${attempt + 1} attempt(s): ${lastErr?.message || 'unknown error'}`);
+    }
+    // Backoff: 1s, 2s, 4s, 8s (+ small jitter to de-sync parallel callers).
+    const wait = 1000 * 2 ** attempt + Math.floor((attempt * 137) % 250);
+    await sleep(wait);
   }
 
   const data = await res.json();
