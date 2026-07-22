@@ -203,6 +203,17 @@ function actionable(root, loc) {
 // DIRO embeds the bank / testing99 UI (bank list, document list, download) inside an
 // iframe, so main-frame-only locators miss it. Poll EVERY frame up to `timeout` for a
 // visible, non-decoy match and return that frame-scoped locator, or null if none appears.
+// Total visible-text length across ALL frames — used to detect whether a click had any
+// effect. Main-frame-only would miss changes confined to an iframe (DIRO renders the
+// bank/document UI in one), causing a real click to be misread as a no-op and re-fired.
+async function totalTextLen(page) {
+  let total = 0;
+  for (const f of page.frames()) {
+    total += await f.evaluate(() => (document.body ? document.body.innerText.length : 0)).catch(() => 0);
+  }
+  return total;
+}
+
 async function findAcrossFrames(page, loc, timeout) {
   const end = Date.now() + timeout;
   for (;;) {
@@ -299,7 +310,7 @@ async function execStep(page, step, timeout = 15000) {
       // fall back to OCR (canvas) reasonably fast — execStepWithRetry covers paint timing.
       const text = locatorText(step.locator);
       const el = await findAcrossFrames(page, step.locator, text ? Math.min(timeout, 5000) : timeout);
-      const before = await page.evaluate(() => document.body.innerText.length).catch(() => -1);
+      const before = await totalTextLen(page); // across all frames (see totalTextLen)
       if (el) {
         // noWaitAfter: a document click can start a file download, which would otherwise
         // hang the click waiting for the page to "settle".
@@ -311,10 +322,10 @@ async function execStep(page, step, timeout = 15000) {
         await page.mouse.click(pt.x, pt.y);
       }
       // Verify the click had an effect: if the control is STILL present AND the page text is
-      // unchanged, it was a no-op (button not yet wired) — throw so the retry clicks again.
-      // A click that advances the screen / starts a download changes the text.
+      // unchanged (in any frame), it was a no-op (button not yet wired) — throw so the retry
+      // clicks again. A click that advances the screen / starts a download changes the text.
       await page.waitForTimeout(1500);
-      const after = await page.evaluate(() => document.body.innerText.length).catch(() => -2);
+      const after = await totalTextLen(page);
       const stillThere = el ? await el.isVisible().catch(() => false) : true;
       if (stillThere && before === after) {
         throw new Error('click had no effect (control not active yet) — retrying');
@@ -494,6 +505,8 @@ async function observe(page) {
       }).catch(() => null);
       if (info && info.vis && !info.decoy && (info.name || info.role === 'textbox' || info.role === 'combobox')) {
         items.push({ ref: 'e' + (n++), role: info.role, name: info.name, handle: h });
+      } else {
+        await h.dispose().catch(() => {}); // drop filtered-out handles so they don't leak
       }
     }
   }
@@ -598,16 +611,22 @@ export async function runCaseAgent(steps, opts = {}) {
           // after navigation, and an empty snapshot must not be read as "expected missing".
           let items = await observe(page);
           for (let w = 0; items.length === 0 && w < 5; w++) { await page.waitForTimeout(2000); items = await observe(page); }
-          let decision;
-          try { decision = await decideAction(step, serializeObs(items), history.join('; ')); }
-          catch (e) { error = 'planner error: ' + e.message; history.push('planner error -> retry'); await page.waitForTimeout(1000); continue; /* transient (e.g. JSON) — retry */ }
-          if (decision.action === 'assertPass' || decision.action === 'done') { status = 'passed'; error = null; break; }
-          if (decision.action === 'assertFail') { status = 'failed'; error = 'expected not met: ' + (decision.reason || ''); break; }
-          let outcome = 'ok';
-          try { await executeDecision(page, decision, items); }
-          catch (e) { outcome = 'ERROR: ' + (e.message || '').slice(0, 60); error = e.message; /* re-observe next loop */ }
-          history.push(`${decision.action}${decision.ref ? ' ' + decision.ref : ''}${decision.value ? ` "${decision.value}"` : ''} -> ${outcome}`);
-          await page.waitForTimeout(1500);
+          try {
+            let decision;
+            try { decision = await decideAction(step, serializeObs(items), history.join('; ')); }
+            catch (e) { error = 'planner error: ' + e.message; history.push('planner error -> retry'); await page.waitForTimeout(1000); continue; /* transient (e.g. JSON) — retry */ }
+            if (decision.action === 'assertPass' || decision.action === 'done') { status = 'passed'; error = null; break; }
+            if (decision.action === 'assertFail') { status = 'failed'; error = 'expected not met: ' + (decision.reason || ''); break; }
+            let outcome = 'ok';
+            try { await executeDecision(page, decision, items); }
+            catch (e) { outcome = 'ERROR: ' + (e.message || '').slice(0, 60); error = e.message; /* re-observe next loop */ }
+            history.push(`${decision.action}${decision.ref ? ' ' + decision.ref : ''}${decision.value ? ` "${decision.value}"` : ''} -> ${outcome}`);
+            await page.waitForTimeout(1500);
+          } finally {
+            // Release this iteration's element handles (re-observed next loop) so they
+            // don't accumulate in the CDP session over a long run.
+            for (const it of items) { if (it.handle) await it.handle.dispose().catch(() => {}); }
+          }
         }
       } catch (e) { status = 'failed'; error = e.message; }
       let shot = null;
