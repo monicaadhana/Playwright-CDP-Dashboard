@@ -22,15 +22,7 @@ try {
   /* no .env file — AI features report "not configured" */
 }
 const gemini = await import('./gemini.mjs');
-const { planFromCommand, planFromTestCase, runPlan, connectPage, runCaseAgent, runCpPositive, runCpPositiveScreenshot } = await import('./browser-control.mjs');
-
-// Critical flows with a hand-written DETERMINISTIC driver (reliable, real assertions) —
-// used instead of the AI executor. Keyed by AIO case key. They run from the dashboard
-// using the Base URL the user typed. Add more entries here as you harden more flows.
-const DETERMINISTIC_FLOWS = {
-  'DIRO-TC-1943': runCpPositive,           // CP_Positive Flow (download → Utility bill-1)
-  'DIRO-TC-2016': runCpPositiveScreenshot, // CP_Positive Flow Download (screenshot → Take photo)
-};
+const { planFromCommand, planFromTestCase, runPlan, connectPage, runCaseAgent, classifyCaptureFlow, runCaptureFlowAuto } = await import('./browser-control.mjs');
 const multer = (await import('multer')).default;
 const excel = await import('./excel.mjs');
 const jira = await import('./jira.mjs');
@@ -1048,22 +1040,22 @@ app.post('/api/aio/run', async (req, res) => {
         const tc = aio.mapCase(detail, map, projectKey);
         expected = tc['Expected Result'] || '';
         const onStep = (u) => log(`  [${u.status}] ${(u.text || '').slice(0, 70)}${u.error ? ' — ' + u.error : ''}`, u.status === 'failed' ? 'stderr' : 'meta');
+        const caseSteps = (Array.isArray(detail.steps) ? detail.steps : []).map((s) => ({
+          step: aio.stripHtml(s.step || ''),
+          data: aio.stripHtml(s.data || s.testData || ''),
+          expected: aio.stripHtml(s.expectedResult || ''),
+        }));
+        // Route by the case's STEP-FLOW signature (not its key): any DIRO capture flow
+        // (download/screenshot, any document) runs the reliable deterministic driver;
+        // everything else uses the observe→act AI executor.
+        const cls = classifyCaptureFlow(caseSteps);
         let result;
-        if (DETERMINISTIC_FLOWS[c.key]) {
-          // Critical flow: run the reliable hand-written driver with the user's Base URL.
-          log(`  (deterministic driver for ${c.key})`, 'meta');
-          result = await DETERMINISTIC_FLOWS[c.key](baseUrl, {
+        if (cls) {
+          log(`  (deterministic capture-flow: ${cls.variant}${cls.document ? ' / ' + cls.document : ''})`, 'meta');
+          result = await runCaptureFlowAuto(baseUrl, caseSteps, {
             page: sharedSession.page, shotDir, shotUrlBase: `/artifacts/${shotName}`, onStep,
           });
         } else {
-          // Observe→act: drive the case's OWN steps, grounding each action in the live page.
-          // No blind plan, no Flow-context needed — reads step + data + expected + the real
-          // on-screen elements. baseUrl only supplies a dynamic/session URL.
-          const caseSteps = (Array.isArray(detail.steps) ? detail.steps : []).map((s) => ({
-            step: aio.stripHtml(s.step || ''),
-            data: aio.stripHtml(s.data || s.testData || ''),
-            expected: aio.stripHtml(s.expectedResult || ''),
-          }));
           result = await runCaseAgent(caseSteps, {
             baseUrl, page: sharedSession.page, shotDir, shotUrlBase: `/artifacts/${shotName}`, onStep,
           });

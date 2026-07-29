@@ -270,6 +270,44 @@ async function ocrLocate(page, target) {
   if (!best || bestD > thresh) return null;
   return { x: Math.round((best.x0 + 25) * sx), y: Math.round((best.y0 + best.y1) / 2 * sy) };
 }
+// Full Levenshtein (for phrase windows bounded near the target length).
+function lev(a, b) {
+  const m = a.length, n = b.length;
+  const d = Array.from({ length: m + 1 }, (_, i) => { const row = new Array(n + 1).fill(0); row[0] = i; return row; });
+  for (let j = 0; j <= n; j++) d[0][j] = j;
+  for (let i = 1; i <= m; i++) for (let j = 1; j <= n; j++) d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+  return d[m][n];
+}
+// WORD-level OCR locate: fuzzy-match `target` across consecutive words and click the
+// matched word run. Unlike ocrLocate (line-level, always left column), this clicks the
+// actual word position — so it works for documents in EITHER column of the list.
+async function ocrLocatePhrase(page, target) {
+  const want = norm(target);
+  if (!want) return null;
+  const buf = await page.screenshot();
+  const imgW = buf.readUInt32BE(16), imgH = buf.readUInt32BE(20);
+  const vp = await page.evaluate(() => ({ w: window.innerWidth, h: window.innerHeight }));
+  const sx = vp.w / imgW, sy = vp.h / imgH;
+  const w = await ocrWorker();
+  const { data } = await w.recognize(buf, {}, { blocks: true });
+  const words = [];
+  for (const bl of data.blocks || []) for (const par of bl.paragraphs || []) for (const ln of par.lines || []) for (const wd of ln.words || []) {
+    const t = norm(wd.text);
+    if (t) words.push({ t, x0: wd.bbox.x0, cy: (wd.bbox.y0 + wd.bbox.y1) / 2 });
+  }
+  const thresh = Math.max(2, Math.round(want.length * 0.25));
+  let best = null, bestD = Infinity;
+  for (let i = 0; i < words.length; i++) {
+    let concat = '';
+    for (let j = i; j < words.length && concat.length <= want.length + 4; j++) {
+      concat += words[j].t;
+      const d = lev(want, concat);
+      if (d < bestD) { bestD = d; best = words[i]; }
+    }
+  }
+  if (!best || bestD > thresh) return null;
+  return { x: Math.round((best.x0 + 12) * sx), y: Math.round(best.cy * sy) };
+}
 // Full OCR text of the viewport (for expectText fallback on canvas screens).
 async function ocrText(page) {
   const w = await ocrWorker();
@@ -658,20 +696,24 @@ export async function runCaseAgent(steps, opts = {}) {
 
 // Shared success checkpoint (both variants end here).
 const VERIFY_SUCCESS = ['Verify success: "Submission successful"', async (page) => {
-  await page.getByText(/submission successful|thank you/i).first().waitFor({ state: 'visible', timeout: 120000 });
+  // The "Verifying" pop-up stays until server-side verification completes, which can run
+  // well past 2 min in sandbox — wait up to 4 min for the success screen before failing.
+  await page.getByText(/submission successful|thank you/i).first().waitFor({ state: 'visible', timeout: 240000 });
 }];
 
-// Download variant (DIRO-TC-1943): Start → pick "Utility bill-1" on the canvas → submit.
-const TAIL_DOWNLOAD = [
+// Download variant: Start → pick the document on the canvas → submit. The document name
+// is taken from the test case's own steps (e.g. "Utility bill-1", "Password protected PDF"),
+// so ANY download case works — word-level OCR clicks it in either column.
+const tailDownload = (document) => [
   ['Bank verification → Start', async (page) => {
     const s = page.getByRole('button', { name: /^start$/i });
     await s.waitFor({ state: 'visible', timeout: 30000 });
     await s.click({ noWaitAfter: true });
   }],
-  ['Select document: Utility bill-1 (canvas / OCR)', async (page) => {
+  [`Select document: ${document} (canvas / OCR)`, async (page) => {
     let pt = null;
-    for (let a = 0; a < 15 && !pt; a++) { pt = await ocrLocate(page, 'Utility bill-1'); if (!pt) await page.waitForTimeout(4000); }
-    if (!pt) throw new Error('Could not locate "Utility bill-1" on the canvas');
+    for (let a = 0; a < 15 && !pt; a++) { pt = await ocrLocatePhrase(page, document); if (!pt) await page.waitForTimeout(4000); }
+    if (!pt) throw new Error(`Could not locate "${document}" on the canvas`);
     await page.mouse.click(pt.x, pt.y);
   }],
   ['Download completes → Submit', async (page) => {
@@ -753,5 +795,37 @@ async function runCaptureFlow(baseUrl, tail, opts = {}) {
   return { url: page.url(), results };
 }
 
-export const runCpPositive = (baseUrl, opts) => runCaptureFlow(baseUrl, TAIL_DOWNLOAD, opts); // DIRO-TC-1943
-export const runCpPositiveScreenshot = (baseUrl, opts) => runCaptureFlow(baseUrl, TAIL_SCREENSHOT, opts); // DIRO-TC-2016
+/**
+ * Classify a test case by its OWN steps (not its key) to pick the deterministic driver.
+ * Returns { variant, document? } for a DIRO capture flow, or null (→ AI executor).
+ * This is what lets NEW download/screenshot cases run reliably: the routing follows the
+ * step-flow signature, so a new case key is handled automatically.
+ */
+export function classifyCaptureFlow(caseSteps) {
+  const all = (caseSteps || []).map((s) => `${s.step || ''} ${s.expected || ''}`).join('\n').toLowerCase();
+  // Signature of the shared DIRO capture shell.
+  const isCapture = /verification url/.test(all) && /continue/.test(all) && /(select your bank|bank search|testing99)/.test(all);
+  if (!isCapture) return null;
+  if (/take photo|screenshot|capture photo|take a photo/.test(all)) return { variant: 'screenshot' };
+  // Download: pull the document name from a "Click <doc>" step (skip nav/control buttons).
+  let document = 'Utility bill-1';
+  for (const s of caseSteps || []) {
+    const m = /\bclick\s+(?:on\s+)?(.+)/i.exec((s.step || '').trim());
+    if (m) {
+      const target = m[1].trim().replace(/["'.]+$/, '');
+      if (target && !/^(continue|start|submit|proceed|take photo|close|back|next|sign in|login)\b/i.test(target)) { document = target; break; }
+    }
+  }
+  return { variant: 'download', document };
+}
+
+// Route a capture-flow case to the right deterministic driver based on its steps.
+export async function runCaptureFlowAuto(baseUrl, caseSteps, opts = {}) {
+  const cls = classifyCaptureFlow(caseSteps) || { variant: 'download', document: 'Utility bill-1' };
+  const tail = cls.variant === 'screenshot' ? TAIL_SCREENSHOT : tailDownload(cls.document);
+  return runCaptureFlow(baseUrl, tail, opts);
+}
+
+// Back-compat explicit wrappers (still usable directly).
+export const runCpPositive = (baseUrl, opts) => runCaptureFlow(baseUrl, tailDownload('Utility bill-1'), opts);
+export const runCpPositiveScreenshot = (baseUrl, opts) => runCaptureFlow(baseUrl, TAIL_SCREENSHOT, opts);
