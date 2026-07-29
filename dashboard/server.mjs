@@ -22,12 +22,15 @@ try {
   /* no .env file — AI features report "not configured" */
 }
 const gemini = await import('./gemini.mjs');
-const { planFromCommand, planFromTestCase, runPlan, connectPage, runCaseAgent, runCpPositive } = await import('./browser-control.mjs');
+const { planFromCommand, planFromTestCase, runPlan, connectPage, runCaseAgent, runCpPositive, runCpPositiveScreenshot } = await import('./browser-control.mjs');
 
 // Critical flows with a hand-written DETERMINISTIC driver (reliable, real assertions) —
 // used instead of the AI executor. Keyed by AIO case key. They run from the dashboard
 // using the Base URL the user typed. Add more entries here as you harden more flows.
-const DETERMINISTIC_FLOWS = { 'DIRO-TC-1943': runCpPositive };
+const DETERMINISTIC_FLOWS = {
+  'DIRO-TC-1943': runCpPositive,           // CP_Positive Flow (download → Utility bill-1)
+  'DIRO-TC-2016': runCpPositiveScreenshot, // CP_Positive Flow Download (screenshot → Take photo)
+};
 const multer = (await import('multer')).default;
 const excel = await import('./excel.mjs');
 const jira = await import('./jira.mjs');

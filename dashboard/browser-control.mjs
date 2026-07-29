@@ -643,34 +643,84 @@ export async function runCaseAgent(steps, opts = {}) {
 }
 
 // ============================================================================
-// Deterministic flow: DIRO CP_Positive (DIRO-TC-1943 "Verify Capture process")
+// Deterministic DIRO CP_Positive capture flows
 // ----------------------------------------------------------------------------
-// Hand-written, reliable drive with real checkpoints — used INSTEAD of the AI executor
-// for this critical flow. Runs from the dashboard using the Base URL the user typed
-// (baseUrl), so no .env access is needed. Returns { url, results } like runPlan.
-// Registered per case key in server.mjs (DETERMINISTIC_FLOWS).
+// Hand-written, reliable drives with real checkpoints — used INSTEAD of the AI executor
+// for these critical flows. Run from the dashboard using the Base URL the user typed, so
+// no .env access is needed. Return { url, results } like runPlan; registered per case key
+// in server.mjs (DETERMINISTIC_FLOWS).
+//
+// All CP_Positive variants share the SAME shell (privacy → country → bank). They diverge
+// only in the capture "tail": Download clicks a canvas document ("Utility bill-1") then
+// submits; Screenshot dismisses "Find info" then clicks "Take photo". Each tail is an
+// ordered list of [checkpointName, fn(page)]; runCaptureFlow runs the shell then the tail.
 // ============================================================================
-export async function runCpPositive(baseUrl, opts = {}) {
+
+// Shared success checkpoint (both variants end here).
+const VERIFY_SUCCESS = ['Verify success: "Submission successful"', async (page) => {
+  await page.getByText(/submission successful|thank you/i).first().waitFor({ state: 'visible', timeout: 120000 });
+}];
+
+// Download variant (DIRO-TC-1943): Start → pick "Utility bill-1" on the canvas → submit.
+const TAIL_DOWNLOAD = [
+  ['Bank verification → Start', async (page) => {
+    const s = page.getByRole('button', { name: /^start$/i });
+    await s.waitFor({ state: 'visible', timeout: 30000 });
+    await s.click({ noWaitAfter: true });
+  }],
+  ['Select document: Utility bill-1 (canvas / OCR)', async (page) => {
+    let pt = null;
+    for (let a = 0; a < 15 && !pt; a++) { pt = await ocrLocate(page, 'Utility bill-1'); if (!pt) await page.waitForTimeout(4000); }
+    if (!pt) throw new Error('Could not locate "Utility bill-1" on the canvas');
+    await page.mouse.click(pt.x, pt.y);
+  }],
+  ['Download completes → Submit', async (page) => {
+    let seen = false;
+    for (let a = 0; a < 45 && !seen; a++) { const t = (await page.evaluate(() => (document.body ? document.body.innerText : '')).catch(() => '')) || ''; if (/please review|proceed anyway|download complete|submit/i.test(t)) { seen = true; break; } await page.waitForTimeout(2000); }
+    if (!seen) throw new Error('Download did not complete / no review-submit screen appeared');
+    for (const name of [/proceed anyway/i, /^submit$/i]) { const b = page.getByRole('button', { name }); if ((await b.count().catch(() => 0)) && (await b.first().isVisible().catch(() => false))) { await b.first().click({ noWaitAfter: true }); break; } }
+  }],
+  VERIFY_SUCCESS,
+];
+
+// Screenshot variant (DIRO-TC-2016): no Start button — the capture screen shows a "Find
+// info" pop-up (Continue) and a "Take photo" control; then Verifying → success.
+const TAIL_SCREENSHOT = [
+  ['Find info pop-up → Continue', async (page) => {
+    const c = page.getByRole('button', { name: /^continue$/i }).first();
+    await c.waitFor({ state: 'visible', timeout: 40000 });
+    await c.click({ noWaitAfter: true });
+  }],
+  ['Click Take photo', async (page) => {
+    const t = page.getByText(/take photo/i).first();
+    await t.waitFor({ state: 'visible', timeout: 20000 });
+    await t.click({ noWaitAfter: true });
+  }],
+  VERIFY_SUCCESS,
+];
+
+// Shared shell + a variant capture tail. `tail` = [[name, fn(page)], ...].
+async function runCaptureFlow(baseUrl, tail, opts = {}) {
   const { page: externalPage = null, onStep = () => {}, shotDir = null, shotUrlBase = null } = opts;
   const session = externalPage ? null : await connectPage();
-  const page = externalPage ?? session.page;
-  page.on('dialog', (d) => d.accept().catch(() => {}));
+  const page = externalPage ?? session.page; // connectPage already attached the dialog handler
   const results = [];
-  const TOTAL = 8;
+  const total = 4 + tail.length; // 4 shared shell steps + tail
   let i = 0;
   const step = async (text, fn) => {
     const idx = i++;
-    onStep({ index: idx, total: TOTAL, text, status: 'running' });
+    onStep({ index: idx, total, text, status: 'running' });
     const t0 = Date.now();
     let status = 'passed', error = null;
     try { await fn(); } catch (e) { status = 'failed'; error = e.message; }
     let shot = null;
     if (shotDir) { try { const f = `${shotDir}/step-${idx + 1}.png`; await page.screenshot({ path: f }); shot = shotUrlBase ? `${shotUrlBase}/step-${idx + 1}.png` : f; } catch {} }
-    onStep({ index: idx, total: TOTAL, text, status, error, shot });
+    onStep({ index: idx, total, text, status, error, shot });
     results.push({ text, status, error, shot, duration: Date.now() - t0 });
     if (status === 'failed') throw new Error('__stop__'); // stop the chain on first failure
   };
   try {
+    // ---- Shared shell (identical across CP_Positive variants) ----
     await step('Open verification URL → Privacy pop-up', async () => {
       if (!baseUrl) throw new Error('Base URL is required — paste the verification link in the dashboard.');
       await page.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
@@ -693,26 +743,8 @@ export async function runCpPositive(baseUrl, opts = {}) {
       await page.waitForTimeout(2000);
       await page.getByText('testing99.diro.me').first().click({ timeout: 10000 });
     });
-    await step('Bank verification → Start', async () => {
-      const s = page.getByRole('button', { name: /^start$/i });
-      await s.waitFor({ state: 'visible', timeout: 30000 });
-      await s.click({ noWaitAfter: true });
-    });
-    await step('Select document: Utility bill-1 (canvas / OCR)', async () => {
-      let pt = null;
-      for (let a = 0; a < 15 && !pt; a++) { pt = await ocrLocate(page, 'Utility bill-1'); if (!pt) await page.waitForTimeout(4000); }
-      if (!pt) throw new Error('Could not locate "Utility bill-1" on the canvas');
-      await page.mouse.click(pt.x, pt.y);
-    });
-    await step('Download completes → Submit', async () => {
-      let seen = false;
-      for (let a = 0; a < 45 && !seen; a++) { const t = (await page.evaluate(() => (document.body ? document.body.innerText : '')).catch(() => '')) || ''; if (/please review|proceed anyway|download complete|submit/i.test(t)) { seen = true; break; } await page.waitForTimeout(2000); }
-      if (!seen) throw new Error('Download did not complete / no review-submit screen appeared');
-      for (const name of [/proceed anyway/i, /^submit$/i]) { const b = page.getByRole('button', { name }); if ((await b.count().catch(() => 0)) && (await b.first().isVisible().catch(() => false))) { await b.first().click({ noWaitAfter: true }); break; } }
-    });
-    await step('Verify success: "Submission successful"', async () => {
-      await page.getByText(/submission successful|thank you/i).first().waitFor({ state: 'visible', timeout: 120000 });
-    });
+    // ---- Variant capture tail ----
+    for (const [name, fn] of tail) await step(name, () => fn(page));
   } catch (e) {
     if (e.message !== '__stop__') results.push({ text: 'unexpected error', status: 'failed', error: e.message, duration: 0 });
   } finally {
@@ -720,3 +752,6 @@ export async function runCpPositive(baseUrl, opts = {}) {
   }
   return { url: page.url(), results };
 }
+
+export const runCpPositive = (baseUrl, opts) => runCaptureFlow(baseUrl, TAIL_DOWNLOAD, opts); // DIRO-TC-1943
+export const runCpPositiveScreenshot = (baseUrl, opts) => runCaptureFlow(baseUrl, TAIL_SCREENSHOT, opts); // DIRO-TC-2016
