@@ -697,8 +697,15 @@ export async function runCaseAgent(steps, opts = {}) {
 // Shared success checkpoint (both variants end here).
 const VERIFY_SUCCESS = ['Verify success: "Submission successful"', async (page) => {
   // The "Verifying" pop-up stays until server-side verification completes, which can run
-  // well past 2 min in sandbox — wait up to 4 min for the success screen before failing.
-  await page.getByText(/submission successful|thank you/i).first().waitFor({ state: 'visible', timeout: 240000 });
+  // past 2 min in sandbox — wait up to 4 min for the success screen. If it never comes,
+  // report WHY: stuck on "Verifying" (a real backend bug worth catching) vs. no success.
+  try {
+    await page.getByText(/submission successful|thank you/i).first().waitFor({ state: 'visible', timeout: 240000 });
+  } catch {
+    const stuck = await page.getByText(/verifying/i).first().isVisible().catch(() => false);
+    if (stuck) throw new Error('Stuck on "Verifying" — verification did not complete within 4 min (possible backend bug)');
+    throw new Error('Final success screen ("Submission successful") never appeared');
+  }
 }];
 
 // Download variant: Start → pick the document on the canvas → submit. The document name
@@ -743,7 +750,7 @@ const TAIL_SCREENSHOT = [
 
 // Shared shell + a variant capture tail. `tail` = [[name, fn(page)], ...].
 async function runCaptureFlow(baseUrl, tail, opts = {}) {
-  const { page: externalPage = null, onStep = () => {}, shotDir = null, shotUrlBase = null } = opts;
+  const { page: externalPage = null, onStep = () => {}, shotDir = null, shotUrlBase = null, country = 'Trinidad and Tobago', bank = 'Testing99' } = opts;
   const session = externalPage ? null : await connectPage();
   const page = externalPage ?? session.page; // connectPage already attached the dialog handler
   const results = [];
@@ -774,16 +781,26 @@ async function runCaptureFlow(baseUrl, tail, opts = {}) {
       for (let a = 0; a < 5 && !ok; a++) { await cont.click({ timeout: 8000, noWaitAfter: true }).catch(() => {}); await page.waitForTimeout(2500); ok = await page.getByText(/Select Your Bank/i).isVisible().catch(() => false); }
       if (!ok) throw new Error('"Select Your Bank" did not appear after clicking Continue');
     });
-    await step('Select country: Trinidad and Tobago', async () => {
+    await step(`Select country: ${country}`, async () => {
       await page.locator('.select2-selection').first().click({ timeout: 8000 });
-      await page.locator('.select2-search__field').fill('Trinidad');
+      await page.locator('.select2-search__field').fill(country);
       await page.waitForTimeout(1500);
-      await page.locator('.select2-results__option', { hasText: 'Trinidad' }).first().click({ timeout: 8000 });
+      // Click the option that matches the country (substring match tolerates extra whitespace).
+      await page.locator('.select2-results__option', { hasText: country }).first().click({ timeout: 8000 });
     });
-    await step('Select bank: Testing99', async () => {
-      await page.locator('#floatingInput').fill('Testing99');
+    await step(`Select bank: ${bank}`, async () => {
+      await page.locator('#floatingInput').fill(bank);
       await page.waitForTimeout(2000);
-      await page.getByText('testing99.diro.me').first().click({ timeout: 10000 });
+      // Click the first result. The card shows a provider domain (e.g. testing99.diro.me,
+      // republictt.com), not always the searched name — so match a domain generically,
+      // then fall back to the bank name text.
+      const byDomain = page.getByText(/\b[a-z0-9-]+\.(me|com|io|net|org|co)\b/i).first();
+      const byName = page.getByText(new RegExp(bank.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')).first();
+      let clicked = false;
+      for (const cand of [byDomain, byName]) {
+        if ((await cand.count().catch(() => 0)) && (await cand.isVisible().catch(() => false))) { await cand.click({ timeout: 10000, noWaitAfter: true }); clicked = true; break; }
+      }
+      if (!clicked) throw new Error(`No bank result to click for "${bank}"`);
     });
     // ---- Variant capture tail ----
     for (const [name, fn] of tail) await step(name, () => fn(page));
@@ -802,28 +819,45 @@ async function runCaptureFlow(baseUrl, tail, opts = {}) {
  * step-flow signature, so a new case key is handled automatically.
  */
 export function classifyCaptureFlow(caseSteps) {
-  const all = (caseSteps || []).map((s) => `${s.step || ''} ${s.expected || ''}`).join('\n').toLowerCase();
+  const steps = caseSteps || [];
+  const all = steps.map((s) => `${s.step || ''} ${s.expected || ''}`).join('\n').toLowerCase();
   // Signature of the shared DIRO capture shell.
   const isCapture = /verification url/.test(all) && /continue/.test(all) && /(select your bank|bank search|testing99)/.test(all);
   if (!isCapture) return null;
-  if (/take photo|screenshot|capture photo|take a photo/.test(all)) return { variant: 'screenshot' };
+
+  // Country + bank come from the case's ordered "Search X" / "Select X" steps: the first
+  // distinct value is the country, the second is the bank (dedupe the Search+Select pair).
+  const picks = [];
+  // Skip shell/instruction phrases that also parse as "Select X" (e.g. "Select Your Bank").
+  const SKIP_PICK = /^(your bank|the bank|a bank|bank|country|the country|continue|start|submit|proceed|take photo|a photo|close|back|next|option|the option|search)$/i;
+  for (const s of steps) {
+    const m = /^(?:search|select)\s+"?([^"]+?)"?\s*$/i.exec((s.step || '').trim());
+    if (m) {
+      const v = m[1].trim().replace(/["'.]+$/, '');
+      if (v && !SKIP_PICK.test(v) && (!picks.length || picks[picks.length - 1].toLowerCase() !== v.toLowerCase())) picks.push(v);
+    }
+  }
+  const country = picks[0] || 'Trinidad and Tobago';
+  const bank = picks[1] || 'Testing99';
+
+  if (/take photo|screenshot|capture photo|take a photo/.test(all)) return { variant: 'screenshot', country, bank };
   // Download: pull the document name from a "Click <doc>" step (skip nav/control buttons).
   let document = 'Utility bill-1';
-  for (const s of caseSteps || []) {
+  for (const s of steps) {
     const m = /\bclick\s+(?:on\s+)?(.+)/i.exec((s.step || '').trim());
     if (m) {
       const target = m[1].trim().replace(/["'.]+$/, '');
       if (target && !/^(continue|start|submit|proceed|take photo|close|back|next|sign in|login)\b/i.test(target)) { document = target; break; }
     }
   }
-  return { variant: 'download', document };
+  return { variant: 'download', document, country, bank };
 }
 
 // Route a capture-flow case to the right deterministic driver based on its steps.
 export async function runCaptureFlowAuto(baseUrl, caseSteps, opts = {}) {
   const cls = classifyCaptureFlow(caseSteps) || { variant: 'download', document: 'Utility bill-1' };
   const tail = cls.variant === 'screenshot' ? TAIL_SCREENSHOT : tailDownload(cls.document);
-  return runCaptureFlow(baseUrl, tail, opts);
+  return runCaptureFlow(baseUrl, tail, { ...opts, country: cls.country, bank: cls.bank });
 }
 
 // Back-compat explicit wrappers (still usable directly).
