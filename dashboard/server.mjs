@@ -37,6 +37,7 @@ function loadCaptureProfile() {
   try { return { ...DEFAULT_CAPTURE_PROFILE, ...(existsSync(CAPTURE_PROFILE_FILE) ? JSON.parse(readFileSync(CAPTURE_PROFILE_FILE, 'utf8')) : {}) }; }
   catch { return { ...DEFAULT_CAPTURE_PROFILE }; }
 }
+function saveCaptureProfile(p) { try { writeFileSync(CAPTURE_PROFILE_FILE, JSON.stringify(p, null, 2), 'utf8'); } catch {} return p; }
 // Parse Country/Bank/Document lines from the dashboard Flow field and persist them, so the
 // user provides the flow config ONCE and it's remembered for later minimal cases.
 function applyFlowOverrides(profile, description) {
@@ -1007,6 +1008,17 @@ app.get('/api/aio/case/:projectKey/:caseKey', async (req, res) => {
   }
 });
 
+// Capture-flow profile (remembered country/bank/default document) — read/saved by the
+// dashboard "Capture flow config" box, and used to run minimal capture cases.
+app.get('/api/capture-profile', (_req, res) => res.json({ ok: true, profile: loadCaptureProfile() }));
+app.post('/api/capture-profile', (req, res) => {
+  const p = loadCaptureProfile();
+  if (req.body?.country != null) p.country = String(req.body.country).trim() || p.country;
+  if (req.body?.bank != null) p.bank = String(req.body.bank).trim() || p.bank;
+  if (req.body?.document != null) p.defaultDocument = String(req.body.document).trim() || p.defaultDocument;
+  res.json({ ok: true, profile: saveCaptureProfile(p) });
+});
+
 // Fetch an AIO folder's test cases and RUN them via the AI executor — nothing is
 // saved to the registry; the combined result + bugs land in Run Results, tagged
 // to the folder. `description` gives shared flow/test-data context to the AI.
@@ -1046,8 +1058,14 @@ app.post('/api/aio/run', async (req, res) => {
     if (!cases.length) { broadcast({ channel: 'grouprun', state: 'error', group, error: ids ? 'None of the selected test cases were found.' : 'No test cases found for that folder.' }); aioRunBusy = false; return; }
     broadcast({ channel: 'grouprun', state: 'start', group, total: cases.length });
     log(`AIO run "${group}" — ${cases.length} case(s)`, 'meta');
-    // Remembered capture-flow config; the Flow field can set/override + persist it.
-    const captureProfile = applyFlowOverrides(loadCaptureProfile(), description);
+    // Remembered capture-flow config; the "Capture flow config" box (explicit fields) and
+    // the Flow field (Country:/Bank:/Document: lines) can set/override + persist it.
+    let captureProfile = applyFlowOverrides(loadCaptureProfile(), description);
+    const uiOv = {};
+    if (req.body?.country) uiOv.country = String(req.body.country).trim();
+    if (req.body?.bank) uiOv.bank = String(req.body.bank).trim();
+    if (req.body?.document) uiOv.defaultDocument = String(req.body.document).trim();
+    if (Object.keys(uiOv).length) captureProfile = saveCaptureProfile({ ...captureProfile, ...uiOv });
 
     const tests = [];
     // One shared CDP connection for the ENTIRE run — reconnecting per case deadlocks
