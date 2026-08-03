@@ -24,6 +24,33 @@ try {
 const gemini = await import('./gemini.mjs');
 const { planFromCommand, planFromTestCase, runPlan, connectPage, runCaseAgent, classifyCaptureFlow, runCaptureFlowAuto } = await import('./browser-control.mjs');
 const multer = (await import('multer')).default;
+
+// ---- Capture-flow PROFILE (the remembered flow config) ------------------------------
+// The full capture flow lives in the deterministic driver, so a case doesn't need to
+// spell out every step. This profile remembers the shared, non-step values (country,
+// bank, default document) so a MINIMAL case (e.g. one step "download document") still
+// runs the whole flow. Set it once via the dashboard "Flow & test-data" field with lines
+// like  Country: India   Bank: Testing99   Document: Utility bill-2  — it's persisted here.
+const CAPTURE_PROFILE_FILE = path.join(ROOT, 'dashboard', 'capture-profile.json');
+const DEFAULT_CAPTURE_PROFILE = { country: 'Trinidad and Tobago', bank: 'Testing99', defaultDocument: 'Utility bill-1' };
+function loadCaptureProfile() {
+  try { return { ...DEFAULT_CAPTURE_PROFILE, ...(existsSync(CAPTURE_PROFILE_FILE) ? JSON.parse(readFileSync(CAPTURE_PROFILE_FILE, 'utf8')) : {}) }; }
+  catch { return { ...DEFAULT_CAPTURE_PROFILE }; }
+}
+// Parse Country/Bank/Document lines from the dashboard Flow field and persist them, so the
+// user provides the flow config ONCE and it's remembered for later minimal cases.
+function applyFlowOverrides(profile, description) {
+  const grab = (re) => { const m = re.exec(description || ''); return m ? m[1].trim() : null; };
+  const country = grab(/country\s*[:=]\s*([^\n]+)/i);
+  const bank = grab(/\bbank\s*[:=]\s*([^\n]+)/i);
+  const doc = grab(/document\s*[:=]\s*([^\n]+)/i);
+  let changed = false;
+  if (country) { profile.country = country; changed = true; }
+  if (bank) { profile.bank = bank; changed = true; }
+  if (doc) { profile.defaultDocument = doc; changed = true; }
+  if (changed) { try { writeFileSync(CAPTURE_PROFILE_FILE, JSON.stringify(profile, null, 2), 'utf8'); } catch {} }
+  return profile;
+}
 const excel = await import('./excel.mjs');
 const jira = await import('./jira.mjs');
 const aio = await import('./aio.mjs');
@@ -1019,6 +1046,8 @@ app.post('/api/aio/run', async (req, res) => {
     if (!cases.length) { broadcast({ channel: 'grouprun', state: 'error', group, error: ids ? 'None of the selected test cases were found.' : 'No test cases found for that folder.' }); aioRunBusy = false; return; }
     broadcast({ channel: 'grouprun', state: 'start', group, total: cases.length });
     log(`AIO run "${group}" — ${cases.length} case(s)`, 'meta');
+    // Remembered capture-flow config; the Flow field can set/override + persist it.
+    const captureProfile = applyFlowOverrides(loadCaptureProfile(), description);
 
     const tests = [];
     // One shared CDP connection for the ENTIRE run — reconnecting per case deadlocks
@@ -1046,14 +1075,17 @@ app.post('/api/aio/run', async (req, res) => {
           expected: aio.stripHtml(s.expectedResult || ''),
         }));
         // Route by the case's STEP-FLOW signature (not its key): any DIRO capture flow
-        // (download/screenshot, any document) runs the reliable deterministic driver;
-        // everything else uses the observe→act AI executor.
-        const cls = classifyCaptureFlow(caseSteps);
+        // (download/screenshot, any document) runs the reliable deterministic driver —
+        // even a MINIMAL case (title/one step), filling shared values from the remembered
+        // profile. Everything else uses the observe→act AI executor.
+        const caseFolder = folderPath || (c.folder ? map[c.folder.ID] || c.folder.name : '');
+        const cls = classifyCaptureFlow(caseSteps, { title: c.title, folder: caseFolder, profile: captureProfile });
         let result;
         if (cls) {
-          log(`  (deterministic capture-flow: ${cls.variant}${cls.document ? ' / ' + cls.document : ''})`, 'meta');
+          log(`  (deterministic capture-flow: ${cls.variant}${cls.document ? ' / ' + cls.document : ''} | ${cls.country} / ${cls.bank})`, 'meta');
           result = await runCaptureFlowAuto(baseUrl, caseSteps, {
             page: sharedSession.page, shotDir, shotUrlBase: `/artifacts/${shotName}`, onStep,
+            title: c.title, folder: caseFolder, profile: captureProfile,
           });
         } else {
           result = await runCaseAgent(caseSteps, {

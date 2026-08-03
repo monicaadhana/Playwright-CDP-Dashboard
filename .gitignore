@@ -15,3 +15,4 @@ dashboard/bugs.json
 
 # Playwright MCP artifacts
 .playwright-mcp/
+dashboard/capture-profile.json

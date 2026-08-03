@@ -818,17 +818,28 @@ async function runCaptureFlow(baseUrl, tail, opts = {}) {
  * This is what lets NEW download/screenshot cases run reliably: the routing follows the
  * step-flow signature, so a new case key is handled automatically.
  */
-export function classifyCaptureFlow(caseSteps) {
+// Known document names on the testing99 list — used to recognize a document from a
+// minimal case's title when its steps don't spell out the full click.
+const KNOWN_DOCS = ['Utility bill-1', 'Utility bill-2', 'Utility bill-3', 'Utility bill-4', 'Utility bill-5', 'Password protected PDF', 'Spreadsheet PDF', 'Images and text PDF', 'Flash PDF', 'Image PDF', 'Nonsearchable PDF', 'Crookedscan PDF', 'Hybrid PDF', 'blank doc PDF', 'Text File'];
+
+export function classifyCaptureFlow(caseSteps, opts = {}) {
+  const { title = '', folder = '', profile = {} } = opts;
   const steps = caseSteps || [];
-  const all = steps.map((s) => `${s.step || ''} ${s.expected || ''}`).join('\n').toLowerCase();
-  // Signature of the shared DIRO capture shell.
-  const isCapture = /verification url/.test(all) && /continue/.test(all) && /(select your bank|bank search|testing99)/.test(all);
+  const stepText = steps.map((s) => `${s.step || ''} ${s.expected || ''}`).join('\n');
+  const all = `${title}\n${stepText}`.toLowerCase();
+  // Strong signal: the full shell appears in the steps. Minimal signal: a capture-process
+  // folder case whose title/steps say to take a photo or download a document — so a case
+  // with ONE step (or just a descriptive title) still runs the full remembered flow.
+  const hasShell = /verification url/.test(all) && /continue/.test(all) && /(select your bank|bank search|testing99)/.test(all);
+  const captureFolder = /capture process|cp_positive|download|screenshot/i.test(folder);
+  const wantsScreenshot = /take photo|screenshot|capture photo|take a photo/.test(all);
+  const wantsDownload = /\bdownload\b|utility bill|password protected pdf|\bstatement\b|\.txt\b|\bpdf\b|\bdocument\b/.test(all);
+  const isCapture = hasShell || (captureFolder && (wantsScreenshot || wantsDownload || /verify capture process|capture process/.test(all)));
   if (!isCapture) return null;
 
-  // Country + bank come from the case's ordered "Search X" / "Select X" steps: the first
-  // distinct value is the country, the second is the bank (dedupe the Search+Select pair).
+  // Country + bank: the case's ordered "Search X"/"Select X" steps (first distinct = country,
+  // second = bank), else the stored profile, else the defaults.
   const picks = [];
-  // Skip shell/instruction phrases that also parse as "Select X" (e.g. "Select Your Bank").
   const SKIP_PICK = /^(your bank|the bank|a bank|bank|country|the country|continue|start|submit|proceed|take photo|a photo|close|back|next|option|the option|search)$/i;
   for (const s of steps) {
     const m = /^(?:search|select)\s+"?([^"]+?)"?\s*$/i.exec((s.step || '').trim());
@@ -837,12 +848,13 @@ export function classifyCaptureFlow(caseSteps) {
       if (v && !SKIP_PICK.test(v) && (!picks.length || picks[picks.length - 1].toLowerCase() !== v.toLowerCase())) picks.push(v);
     }
   }
-  const country = picks[0] || 'Trinidad and Tobago';
-  const bank = picks[1] || 'Testing99';
+  const country = picks[0] || profile.country || 'Trinidad and Tobago';
+  const bank = picks[1] || profile.bank || 'Testing99';
 
-  if (/take photo|screenshot|capture photo|take a photo/.test(all)) return { variant: 'screenshot', country, bank };
-  // Download: pull the document name from a "Click <doc>" step (skip nav/control buttons).
-  let document = 'Utility bill-1';
+  if (wantsScreenshot) return { variant: 'screenshot', country, bank };
+
+  // Download document: a "Click <doc>" step → a known doc named in the title → profile default.
+  let document = null;
   for (const s of steps) {
     const m = /\bclick\s+(?:on\s+)?(.+)/i.exec((s.step || '').trim());
     if (m) {
@@ -850,12 +862,15 @@ export function classifyCaptureFlow(caseSteps) {
       if (target && !/^(continue|start|submit|proceed|take photo|close|back|next|sign in|login)\b/i.test(target)) { document = target; break; }
     }
   }
+  if (!document) document = KNOWN_DOCS.find((d) => (title + ' ' + stepText).toLowerCase().includes(d.toLowerCase())) || null;
+  document = document || profile.defaultDocument || 'Utility bill-1';
   return { variant: 'download', document, country, bank };
 }
 
-// Route a capture-flow case to the right deterministic driver based on its steps.
+// Route a capture-flow case to the right deterministic driver based on its steps + profile.
 export async function runCaptureFlowAuto(baseUrl, caseSteps, opts = {}) {
-  const cls = classifyCaptureFlow(caseSteps) || { variant: 'download', document: 'Utility bill-1' };
+  const { title, folder, profile } = opts;
+  const cls = classifyCaptureFlow(caseSteps, { title, folder, profile }) || { variant: 'download', document: (profile && profile.defaultDocument) || 'Utility bill-1', country: (profile && profile.country) || 'Trinidad and Tobago', bank: (profile && profile.bank) || 'Testing99' };
   const tail = cls.variant === 'screenshot' ? TAIL_SCREENSHOT : tailDownload(cls.document);
   return runCaptureFlow(baseUrl, tail, { ...opts, country: cls.country, bank: cls.bank });
 }
