@@ -719,8 +719,16 @@ const tailDownload = (document) => [
   }],
   [`Select document: ${document} (canvas / OCR)`, async (page) => {
     let pt = null;
-    for (let a = 0; a < 15 && !pt; a++) { pt = await ocrLocatePhrase(page, document); if (!pt) await page.waitForTimeout(4000); }
-    if (!pt) throw new Error(`Could not locate "${document}" on the canvas`);
+    await page.mouse.move(500, 400).catch(() => {}); // hover the list so wheel scrolls it
+    for (let a = 0; a < 15 && !pt; a++) {
+      pt = await ocrLocatePhrase(page, document);
+      if (pt) break;
+      // Not visible yet — wait for paint on the first tries, then scroll to reveal
+      // documents below the fold (the list is long; OCR only sees the viewport).
+      if (a < 2) await page.waitForTimeout(4000);
+      else { await page.mouse.wheel(0, 450).catch(() => {}); await page.waitForTimeout(1500); }
+    }
+    if (!pt) throw new Error(`Could not locate "${document}" on the canvas (not found even after scrolling)`);
     await page.mouse.click(pt.x, pt.y);
   }],
   ['Download completes → Submit', async (page) => {
@@ -858,7 +866,13 @@ export function classifyCaptureFlow(caseSteps, opts = {}) {
   for (const s of steps) {
     const m = /\bclick\s+(?:on\s+)?(.+)/i.exec((s.step || '').trim());
     if (m) {
-      const target = m[1].trim().replace(/["'.]+$/, '');
+      const target = m[1].trim()
+        .replace(/\s*\([^)]*(?:https?:\/\/|link)[^)]*\)/gi, '') // drop "(Link: https://…)" but keep "(Feb - Apr)"
+        .replace(/\b(?:link|url)\s*[:=]\s*/gi, ' ')             // drop leftover "Link:" / "URL="
+        .replace(/https?:\/\/\S+/gi, '')                        // drop any bare URL
+        .replace(/["'.]+$/, '')
+        .replace(/\s{2,}/g, ' ')
+        .trim();
       if (target && !/^(continue|start|submit|proceed|take photo|close|back|next|sign in|login)\b/i.test(target)) { document = target; break; }
     }
   }
