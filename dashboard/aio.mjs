@@ -14,12 +14,26 @@ const headers = () => ({
 
 async function aioGet(path) {
   if (!isConfigured()) throw new Error('AIO is not configured. Set AIO_API_KEY in .env.');
-  const res = await fetch(base() + path, { headers: headers(), signal: AbortSignal.timeout(25000) });
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new Error(`AIO ${res.status}: ${body.slice(0, 160)}`);
+  const url = base() + path;
+  const MAX = 4; // total attempts = MAX + 1
+  let lastErr;
+  for (let attempt = 0; attempt <= MAX; attempt++) {
+    let res = null;
+    try { res = await fetch(url, { headers: headers(), signal: AbortSignal.timeout(25000) }); }
+    catch (e) { lastErr = e; }
+    if (res && res.ok) return res.json();
+    // Retry transient failures: 429 (rate limit), 5xx, and network/timeout errors.
+    const retryable = !res || res.status === 429 || res.status >= 500;
+    if (!retryable || attempt === MAX) {
+      if (res) { const body = await res.text().catch(() => ''); throw new Error(`AIO ${res.status}: ${body.slice(0, 160)}`); }
+      throw new Error(`AIO request failed after ${attempt + 1} attempt(s): ${lastErr?.message || 'unknown error'}`);
+    }
+    // Honor Retry-After (seconds) when present; else exponential backoff 2/4/8/16s (cap 30s).
+    let waitMs = Math.min(1000 * 2 ** (attempt + 1), 30000);
+    const ra = res && res.headers.get('retry-after');
+    if (ra) { const s = parseInt(ra, 10); if (!Number.isNaN(s)) waitMs = Math.min(s * 1000, 30000); }
+    await new Promise((r) => setTimeout(r, waitMs));
   }
-  return res.json();
 }
 
 export const stripHtml = (s) =>
