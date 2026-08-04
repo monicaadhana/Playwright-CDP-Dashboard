@@ -177,18 +177,33 @@ export async function buildRegistryExport(cases) {
 }
 
 const BUG_COLUMNS = [
-  'Bug ID', 'Test Case ID', 'Test Case Name', 'Run ID', 'Execution Date',
-  'Severity', 'Priority', 'Status', 'Bug Title', 'Description', 'Failed Step Number',
-  'Expected Result', 'Actual Result', 'Screenshot Reference', 'Browser', 'OS',
-  'Device', 'Environment', 'AI Confidence', 'Assigned To', 'Reporter', 'Created Date',
+  'Bug ID', 'Test Case ID', 'Test Case Name', 'Execution Date',
+  'Status', 'Bug Title', 'Description',
+  'Expected Result', 'Actual Result', 'Screenshot Reference',
 ];
 
-/** Bug records → formatted xlsx (bold/frozen header, autosized). */
-export async function buildBugReport(bugs) {
+/**
+ * Bug records → formatted xlsx (bold/frozen header, autosized).
+ * `opts.origin` (e.g. http://localhost:4000) makes the Screenshot Reference an absolute,
+ * clickable hyperlink — the stored value is a relative /artifacts path, which isn't a
+ * valid URL on its own (that's why it opened as an "invalid image").
+ */
+export async function buildBugReport(bugs, opts = {}) {
+  const origin = String(opts.origin || '').replace(/\/$/, '');
   const wb = new ExcelJS.Workbook();
   const ws = wb.addWorksheet('Bugs');
   ws.columns = BUG_COLUMNS.map((c) => ({ header: c, key: c }));
-  for (const b of bugs) ws.addRow(BUG_COLUMNS.reduce((o, c) => ((o[c] = b[c] ?? ''), o), {}));
+  const shotCol = BUG_COLUMNS.indexOf('Screenshot Reference') + 1;
+  for (const b of bugs) {
+    const added = ws.addRow(BUG_COLUMNS.reduce((o, c) => ((o[c] = b[c] ?? ''), o), {}));
+    const rel = String(b['Screenshot Reference'] ?? '').trim();
+    if (rel) {
+      const url = /^https?:\/\//i.test(rel) ? rel : origin + (rel.startsWith('/') ? rel : '/' + rel);
+      const cell = added.getCell(shotCol);
+      cell.value = { text: url, hyperlink: url }; // clickable link that opens the screenshot
+      cell.font = { color: { argb: 'FF0563C1' }, underline: true };
+    }
+  }
   styleHeader(ws);
   autosize(ws);
   return toBuffer(wb);
