@@ -1,6 +1,8 @@
 // Excel parsing (SheetJS, reads .xls + .xlsx) and formatted writing (ExcelJS).
 import ExcelJS from 'exceljs';
 import * as XLSX from 'xlsx';
+import { readFileSync, existsSync } from 'node:fs';
+import path from 'node:path';
 
 /** Canonical registry columns, in template order. */
 export const REGISTRY_COLUMNS = [
@@ -184,28 +186,52 @@ const BUG_COLUMNS = [
 
 /**
  * Bug records → formatted xlsx (bold/frozen header, autosized).
- * `opts.origin` (e.g. http://localhost:4000) makes the Screenshot Reference an absolute,
- * clickable hyperlink — the stored value is a relative /artifacts path, which isn't a
- * valid URL on its own (that's why it opened as an "invalid image").
+ * The screenshot is EMBEDDED into the sheet as an image, so it opens from a downloaded
+ * file (and old sheets) with no server needed. `opts.artifactsDir` is where the on-disk
+ * screenshots live (…/test-results); `opts.origin` adds a fallback clickable URL.
+ * Resolve a stored "/artifacts/<name>/<file>.png" reference to its file on disk.
  */
+function shotDiskPath(artifactsDir, rel) {
+  if (!artifactsDir || !rel || /^https?:\/\//i.test(rel)) return null;
+  const sub = rel.replace(/^\/?artifacts\//i, '').replace(/^\/+/, '');
+  const p = path.join(artifactsDir, sub);
+  return existsSync(p) ? p : null;
+}
 export async function buildBugReport(bugs, opts = {}) {
   const origin = String(opts.origin || '').replace(/\/$/, '');
+  const artifactsDir = opts.artifactsDir || '';
   const wb = new ExcelJS.Workbook();
   const ws = wb.addWorksheet('Bugs');
   ws.columns = BUG_COLUMNS.map((c) => ({ header: c, key: c }));
   const shotCol = BUG_COLUMNS.indexOf('Screenshot Reference') + 1;
+  autosize(ws); // size text columns from header/typical width before we widen the shot column
+  ws.getColumn(shotCol).width = 70; // room for the embedded image
+  const IMG_W = 460, IMG_H = 210; // px thumbnail (DIRO screenshots are ~2.2:1)
   for (const b of bugs) {
     const added = ws.addRow(BUG_COLUMNS.reduce((o, c) => ((o[c] = b[c] ?? ''), o), {}));
     const rel = String(b['Screenshot Reference'] ?? '').trim();
-    if (rel) {
-      const url = /^https?:\/\//i.test(rel) ? rel : origin + (rel.startsWith('/') ? rel : '/' + rel);
-      const cell = added.getCell(shotCol);
-      cell.value = { text: url, hyperlink: url }; // clickable link that opens the screenshot
-      cell.font = { color: { argb: 'FF0563C1' }, underline: true };
+    if (!rel) continue;
+    const url = /^https?:\/\//i.test(rel) ? rel : origin + (rel.startsWith('/') ? rel : '/' + rel);
+    const cell = added.getCell(shotCol);
+    // Keep the URL as a fallback clickable link (works when the dashboard is running).
+    cell.value = { text: 'Open full screenshot ↗', hyperlink: url };
+    cell.font = { color: { argb: 'FF0563C1' }, underline: true };
+    cell.alignment = { vertical: 'top' };
+    // Embed the image itself so it's viewable offline / from the downloaded file.
+    const disk = shotDiskPath(artifactsDir, rel);
+    if (disk) {
+      try {
+        const imgId = wb.addImage({ buffer: readFileSync(disk), extension: 'png' });
+        added.height = IMG_H * 0.78; // pt ≈ px*0.75, +a little for the link line
+        ws.addImage(imgId, {
+          tl: { col: shotCol - 1, row: added.number - 1 + 0.18 }, // just below the link text
+          ext: { width: IMG_W, height: IMG_H },
+          editAs: 'oneCell',
+        });
+      } catch { /* unreadable image — keep just the link */ }
     }
   }
   styleHeader(ws);
-  autosize(ws);
   return toBuffer(wb);
 }
 

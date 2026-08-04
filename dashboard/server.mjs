@@ -726,8 +726,9 @@ app.get('/api/registry/export.xlsx', async (req, res) => {
 
 app.get('/api/bugs/export.xlsx', async (req, res) => {
   const { severity, status, runId, search } = req.query;
-  const origin = `${req.protocol}://${req.get('host')}`; // absolute base for clickable screenshot links
-  sendXlsx(res, await excel.buildBugReport(bugs.list({ severity, status, runId, search }), { origin }), 'bug-report.xlsx');
+  const origin = `${req.protocol}://${req.get('host')}`; // fallback clickable link
+  const artifactsDir = path.join(ROOT, 'test-results'); // on-disk screenshots to embed
+  sendXlsx(res, await excel.buildBugReport(bugs.list({ severity, status, runId, search }), { origin, artifactsDir }), 'bug-report.xlsx');
 });
 
 app.get('/api/results/export.xlsx', async (req, res) => {
