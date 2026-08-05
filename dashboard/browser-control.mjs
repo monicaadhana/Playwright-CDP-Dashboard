@@ -708,37 +708,83 @@ const VERIFY_SUCCESS = ['Verify success: "Submission successful"', async (page) 
   }
 }];
 
-// Download variant: Start → pick the document on the canvas → submit. The document name
-// is taken from the test case's own steps (e.g. "Utility bill-1", "Password protected PDF"),
-// so ANY download case works — word-level OCR clicks it in either column.
-const tailDownload = (document) => [
-  ['Bank verification → Start', async (page) => {
-    const s = page.getByRole('button', { name: /^start$/i });
-    await s.waitFor({ state: 'visible', timeout: 30000 });
-    await s.click({ noWaitAfter: true });
-  }],
-  [`Select document: ${document} (canvas / OCR)`, async (page) => {
-    let pt = null;
-    await page.mouse.move(500, 400).catch(() => {}); // hover the list so wheel scrolls it
-    for (let a = 0; a < 15 && !pt; a++) {
-      pt = await ocrLocatePhrase(page, document);
-      if (pt) break;
-      // Not visible yet — wait for paint on the first tries, then scroll to reveal
-      // documents below the fold (the list is long; OCR only sees the viewport).
-      if (a < 2) await page.waitForTimeout(4000);
-      else { await page.mouse.wheel(0, 450).catch(() => {}); await page.waitForTimeout(1500); }
+// Concatenate all visible text across every frame (fast DOM read for outcome polling).
+async function allFrameText(page) {
+  let text = '';
+  for (const f of page.frames()) text += ((await f.evaluate(() => (document.body ? document.body.innerText : '')).catch(() => '')) || '') + '\n';
+  return text;
+}
+
+// Poll for a terminal outcome (`rx`) after the document is clicked. DOM is checked every
+// pass (fast); OCR is checked periodically in case the outcome is painted on the canvas.
+// When `driveSubmit` is true (success flows), any "Proceed anyway"/"Submit" that appears is
+// clicked to advance the review→submit→success chain — but we NEVER click submit otherwise,
+// so a flow that ends earlier (e.g. a corrupt pop-up) is honoured exactly as the case wrote it.
+async function waitOutcome(page, rx, timeoutMs, driveSubmit) {
+  const end = Date.now() + timeoutMs;
+  let i = 0;
+  while (Date.now() < end) {
+    if (rx.test(await allFrameText(page))) return;
+    if (driveSubmit) {
+      for (const name of [/proceed anyway/i, /^submit$/i]) {
+        const b = page.getByRole('button', { name }).first();
+        if ((await b.count().catch(() => 0)) && (await b.isVisible().catch(() => false))) { await b.click({ noWaitAfter: true }).catch(() => {}); break; }
+      }
     }
-    if (!pt) throw new Error(`Could not locate "${document}" on the canvas (not found even after scrolling)`);
-    await page.mouse.click(pt.x, pt.y);
-  }],
-  ['Download completes → Submit', async (page) => {
-    let seen = false;
-    for (let a = 0; a < 45 && !seen; a++) { const t = (await page.evaluate(() => (document.body ? document.body.innerText : '')).catch(() => '')) || ''; if (/please review|proceed anyway|download complete|submit/i.test(t)) { seen = true; break; } await page.waitForTimeout(2000); }
-    if (!seen) throw new Error('Download did not complete / no review-submit screen appeared');
-    for (const name of [/proceed anyway/i, /^submit$/i]) { const b = page.getByRole('button', { name }); if ((await b.count().catch(() => 0)) && (await b.first().isVisible().catch(() => false))) { await b.first().click({ noWaitAfter: true }); break; } }
-  }],
-  VERIFY_SUCCESS,
-];
+    if (i % 4 === 3) { try { if (rx.test(await ocrText(page))) return; } catch {} }
+    i++;
+    await page.waitForTimeout(2500);
+  }
+  try { if (rx.test(await ocrText(page))) return; } catch {} // one last canvas check
+  if (driveSubmit) {
+    const stuck = await page.getByText(/verifying/i).first().isVisible().catch(() => false);
+    if (stuck) throw new Error('Stuck on "Verifying" — verification did not complete within the timeout (possible backend bug)');
+  }
+  throw new Error(`Expected terminal outcome (${rx}) never appeared within ${Math.round(timeoutMs / 1000)}s`);
+}
+
+// The document-click step, shared by every download tail: hover the canvas list, OCR-locate
+// the document (scrolling to reveal ones below the fold), then click it.
+const docClickStep = (document) => [`Select document: ${document} (canvas / OCR)`, async (page) => {
+  let pt = null;
+  await page.mouse.move(500, 400).catch(() => {}); // hover the list so wheel scrolls it
+  for (let a = 0; a < 15 && !pt; a++) {
+    pt = await ocrLocatePhrase(page, document);
+    if (pt) break;
+    if (a < 2) await page.waitForTimeout(4000);
+    else { await page.mouse.wheel(0, 450).catch(() => {}); await page.waitForTimeout(1500); }
+  }
+  if (!pt) throw new Error(`Could not locate "${document}" on the canvas (not found even after scrolling)`);
+  await page.mouse.click(pt.x, pt.y);
+}];
+
+// Download variant: Start → pick the document on the canvas → verify the case's OWN terminal.
+// The shell + document click are the remembered, deterministic flow; the FINAL checkpoint is
+// derived from the case text so we don't force a submit/success that the case never asked for:
+//   • text mentions "corrupt"                       → wait for the Corrupt pop-up (no submit)
+//   • text mentions submit/submission successful    → drive Proceed/Submit → success screen
+//   • text mentions download complete / 100%        → wait for the download-complete screen
+//   • otherwise                                      → wait for any known download outcome
+// `caseText` = the case title + all its steps/expected results (empty ⇒ default success flow).
+function terminalFor(caseText) {
+  const t = String(caseText || '').toLowerCase();
+  if (/corrupt/.test(t)) return { rx: /corrupt/i, label: 'Corrupt pop-up', drive: false, timeout: 120000 };
+  if (/submission successful|thank you|\bsubmit\b/.test(t)) return { rx: /submission successful|thank you/i, label: 'Submission successful', drive: true, timeout: 240000 };
+  if (/download complete|reaches\s*100|100\s*%/.test(t)) return { rx: /download complete|please review|proceed anyway|100\s*%/i, label: 'Download complete', drive: false, timeout: 120000 };
+  return { rx: /submission successful|thank you|download complete|please review|proceed anyway/i, label: 'Download outcome', drive: true, timeout: 180000 };
+}
+const tailDownload = (document, caseText = '') => {
+  const term = terminalFor(caseText);
+  return [
+    ['Bank verification → Start', async (page) => {
+      const s = page.getByRole('button', { name: /^start$/i });
+      await s.waitFor({ state: 'visible', timeout: 30000 });
+      await s.click({ noWaitAfter: true });
+    }],
+    docClickStep(document),
+    [`Verify outcome: "${term.label}"`, async (page) => waitOutcome(page, term.rx, term.timeout, term.drive)],
+  ];
+};
 
 // Screenshot variant (DIRO-TC-2016): no Start button — the capture screen shows a "Find
 // info" pop-up (Continue) and a "Take photo" control; then Verifying → success.
@@ -885,7 +931,10 @@ export function classifyCaptureFlow(caseSteps, opts = {}) {
 export async function runCaptureFlowAuto(baseUrl, caseSteps, opts = {}) {
   const { title, folder, profile } = opts;
   const cls = classifyCaptureFlow(caseSteps, { title, folder, profile }) || { variant: 'download', document: (profile && profile.defaultDocument) || 'Utility bill-1', country: (profile && profile.country) || 'Trinidad and Tobago', bank: (profile && profile.bank) || 'Testing99' };
-  const tail = cls.variant === 'screenshot' ? TAIL_SCREENSHOT : tailDownload(cls.document);
+  // Case text (title + every step/expected) drives the download tail's terminal checkpoint,
+  // so each case is verified against its OWN last-expected outcome (submit vs. corrupt vs. …).
+  const caseText = [title || '', ...(caseSteps || []).map((s) => `${s.step || ''} ${s.expected || ''}`)].join('\n');
+  const tail = cls.variant === 'screenshot' ? TAIL_SCREENSHOT : tailDownload(cls.document, caseText);
   return runCaptureFlow(baseUrl, tail, { ...opts, country: cls.country, bank: cls.bank });
 }
 
